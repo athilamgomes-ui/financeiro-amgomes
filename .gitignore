@@ -4,3 +4,4 @@ node_modules/
 # DADOS SENSÍVEIS EM TEXTO PURO — NUNCA vão pro repo público (só o HTML cifrado é publicado)
 financeiro_raw.json
 fat_*.json
+RUNBOOK_FINANCEIRO.md
