@@ -1,0 +1,6 @@
+node_modules/
+*.log
+.DS_Store
+# DADOS SENSÍVEIS EM TEXTO PURO — NUNCA vão pro repo público (só o HTML cifrado é publicado)
+financeiro_raw.json
+fat_*.json
