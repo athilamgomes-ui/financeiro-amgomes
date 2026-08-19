@@ -137,6 +137,9 @@ function segundaISO(d) { const dow = (d.getDay() + 6) % 7; const s = new Date(d)
 // da segunda desta semana até a semana que contém 31/dez (alcança o Q4 inteiro)
 const SEMANAS = (() => { const arr = []; let s = new Date(now); const dow = (s.getDay() + 6) % 7; s.setDate(s.getDate() - dow); const fim = new Date(now.getFullYear(), 11, 31); while (s <= fim) { arr.push(`${s.getFullYear()}-${pad(s.getMonth() + 1)}-${pad(s.getDate())}`); s.setDate(s.getDate() + 7); } return arr; })();
 const semLabel = k => { const [y, m, d] = k.split("-"); return `${d}/${m}`; };
+// meses do fluxo: do mês corrente até dez/ano-corrente
+const MESES_FLUXO = (() => { const arr = []; for (let mo = now.getMonth() + 1; mo <= 12; mo++) arr.push(`${now.getFullYear()}-${pad(mo)}`); return arr; })();
+const mesLabelYM = ym => { const [y, m] = ym.split("-"); return `${MESES_PT[+m - 1]}/${y.slice(2)}`; };
 
 // ── modelo por loja ──
 function modeloLoja(key, idx) {
@@ -180,7 +183,26 @@ function modeloLoja(key, idx) {
     const entra = liquido(entraBruta);
     return { k, sai: saiErp + caixa, saiErp, caixa, entraBruta, entra };
   });
+  // ── modelo MENSAL (mês corrente → dez): entrada líquida vs compromisso, com custo fixo RESERVADO ──
+  // Piso de custo fixo p/ meses à frente = maior custo fixo entre o último mês fechado e os 2 próximos
+  // (o lançado de meses distantes fica incompleto; reservar o nível recente evita superestimar a sobra).
+  // piso = custo fixo do último mês FECHADO (real, pago). Fallback: maior custo fixo lançado conhecido.
+  const baseFixo = (custoFixoPorMes[MES_ANT] || 0) || Math.max(0, ...Object.values(custoFixoPorMes));
+  const caixaMes = (CAIXA_PARCELA && CAIXA_PARCELA.lojas.includes(key)) ? CAIXA_PARCELA.valor / CAIXA_PARCELA.lojas.length : 0;
+  const mensal = MESES_FLUXO.map(ym => {
+    const y = +ym.slice(0, 4), mesN = +ym.slice(5);
+    const emCurso = ym === MES_ATUAL;
+    const entraBruta = (emCurso || !TEM_SAZONAL) ? ritmoDia * diasNoMes(y, mesN) : projMesLoja(key, mesN);
+    const entra = liquido(entraBruta);
+    const fixoLanc = custoFixoPorMes[ym] || 0;
+    const fixoEsp = Math.max(fixoLanc, baseFixo);          // reserva o piso p/ meses incompletos
+    const totalPagar = (pagar.porMes[ym] || {}).total || 0;
+    const outros = Math.max(0, totalPagar - fixoLanc);     // variável já lançado (mercadoria, impostos…)
+    const compromisso = fixoEsp + outros + caixaMes;
+    return { ym, emCurso, entra, fixoEsp, fixoLanc, outros, caixa: caixaMes, compromisso, cabe: entra - compromisso };
+  });
   return {
+    mensal, baseFixo,
     key, meses, serie26, serie25, iAtual, fatAtual, fatAnt, fat25Atual, ritmoDia,
     buckets, totalDespesa,
     pagarAberto: pagar.abertoValor, pagarAtrasado: pagar.atrasadoValor, pagarAtrasadoQtd: pagar.atrasadoQtd,
@@ -196,7 +218,7 @@ const M = {}; LOJAS.forEach((l, i) => { M[l.key] = modeloLoja(l.key, i); });
 
 // grupo consolidado
 function modeloGrupo() {
-  const g = { buckets: {}, fluxo: SEMANAS.map(k => ({ k, sai: 0, saiErp: 0, caixa: 0, entra: 0, entraBruta: 0 })), pagarPorMes: {}, receberPorMes: {}, pagoPorMes: {}, custoFixoPorMes: {} };
+  const g = { buckets: {}, fluxo: SEMANAS.map(k => ({ k, sai: 0, saiErp: 0, caixa: 0, entra: 0, entraBruta: 0 })), mensal: MESES_FLUXO.map(ym => ({ ym, emCurso: ym === MES_ATUAL, entra: 0, fixoEsp: 0, fixoLanc: 0, outros: 0, caixa: 0, compromisso: 0, cabe: 0 })), pagarPorMes: {}, receberPorMes: {}, pagoPorMes: {}, custoFixoPorMes: {} };
   for (const b of BUCKETS) g.buckets[b.key] = 0;
   let fatAtual = 0, fatAnt = 0, fat25Atual = 0, pagarAberto = 0, pagarAtrasado = 0, pagarAtrasadoQtd = 0,
     receberAberto = 0, receberAtrasado = 0, receberAtrasadoQtd = 0, pagarMes = 0, pagarMesAnt = 0, totalDespesa = 0,
@@ -216,6 +238,7 @@ function modeloGrupo() {
     m.serie26.forEach((v, i) => serie26[i] += v);
     m.serie25.forEach((v, i) => serie25[i] += v);
     m.fluxo.forEach((f, i) => { g.fluxo[i].sai += f.sai; g.fluxo[i].saiErp += f.saiErp; g.fluxo[i].caixa += f.caixa; g.fluxo[i].entra += f.entra; g.fluxo[i].entraBruta += f.entraBruta; });
+    m.mensal.forEach((mm, i) => { g.mensal[i].entra += mm.entra; g.mensal[i].fixoEsp += mm.fixoEsp; g.mensal[i].fixoLanc += mm.fixoLanc; g.mensal[i].outros += mm.outros; g.mensal[i].caixa += mm.caixa; g.mensal[i].compromisso += mm.compromisso; g.mensal[i].cabe += mm.cabe; });
     for (const [k, v] of Object.entries(m.pagarPorMes)) { g.pagarPorMes[k] = g.pagarPorMes[k] || { total: 0 }; g.pagarPorMes[k].total += v.total; }
     for (const [k, v] of Object.entries(m.receberPorMes)) { g.receberPorMes[k] = g.receberPorMes[k] || { total: 0 }; g.receberPorMes[k].total += v.total; }
   }
@@ -227,6 +250,7 @@ function modeloGrupo() {
   };
   const topForn = mergeTop("topFornecedores"), topCli = mergeTop("topClientes");
   return {
+    mensal: g.mensal,
     key: "GRUPO", meses: fat26.meses, serie26, serie25, iAtual: fat26.meses.length - 1, ritmoDia,
     fatAtual, fatAnt, fat25Atual, buckets: g.buckets, totalDespesa,
     pagarAberto, pagarAtrasado, pagarAtrasadoQtd, receberAberto, receberAtrasado, receberAtrasadoQtd,
@@ -266,6 +290,36 @@ function svgFluxo(fluxo, id) {
     <line x1="${padL}" y1="${padT + chartH}" x2="${W - padR}" y2="${padT + chartH}" stroke="#e2e8f0"/>
     ${bars}
     <polyline points="${poly}" fill="none" stroke="#334155" stroke-width="1.5" stroke-dasharray="3 3" opacity="0.55"/>
+    ${labels}
+  </svg>`;
+}
+
+// fluxo MENSAL: entra líq. vs compromisso (c/ custo fixo reservado); rótulo de cima = cabe comprar; linha = caixa acum.
+function svgFluxoMensal(mensal, id) {
+  const W = 860, H = 240, padL = 8, padR = 8, padT = 24, padB = 34;
+  const n = mensal.length, bw = (W - padL - padR) / n;
+  const max = Math.max(1, ...mensal.map(m => Math.max(m.entra, m.compromisso)));
+  const chartH = H - padT - padB;
+  const y = v => padT + chartH * (1 - v / max);
+  let bars = "", labels = "", sacc = 0, linePts = [];
+  mensal.forEach((m, i) => {
+    const x = padL + i * bw;
+    const w2 = bw * 0.30;
+    const hE = chartH * (m.entra / max), hC = chartH * (m.compromisso / max);
+    bars += `<rect x="${(x + bw * 0.16).toFixed(1)}" y="${y(m.entra).toFixed(1)}" width="${w2.toFixed(1)}" height="${hE.toFixed(1)}" rx="3" fill="#10b981"><title>Entra ${mesLabelYM(m.ym)}: ${fmt(m.entra)}</title></rect>`;
+    bars += `<rect x="${(x + bw * 0.54).toFixed(1)}" y="${y(m.compromisso).toFixed(1)}" width="${w2.toFixed(1)}" height="${hC.toFixed(1)}" rx="3" fill="#ef4444"><title>Compromisso ${mesLabelYM(m.ym)}: ${fmt(m.compromisso)}</title></rect>`;
+    labels += `<text x="${(x + bw / 2).toFixed(1)}" y="${padT - 9}" text-anchor="middle" font-size="10.5" fill="${m.cabe < 0 ? "#dc2626" : "#059669"}" font-weight="700"><title>cabe comprar</title>${fmtK(m.cabe)}</text>`;
+    const aperto = m.compromisso > m.entra;
+    labels += `<text x="${(x + bw / 2).toFixed(1)}" y="${H - 16}" text-anchor="middle" font-size="11" fill="${aperto ? "#dc2626" : "#64748b"}" font-weight="${aperto ? 700 : 500}">${mesLabelYM(m.ym)}</text>`;
+    sacc += m.cabe; linePts.push([x + bw / 2, sacc]);
+  });
+  const accMax = Math.max(1, ...linePts.map(p => Math.abs(p[1])));
+  const yAcc = v => padT + chartH / 2 * (1 - v / accMax);
+  const poly = linePts.map(p => `${p[0].toFixed(1)},${yAcc(p[1]).toFixed(1)}`).join(" ");
+  return `<svg viewBox="0 0 ${W} ${H}" class="chart" preserveAspectRatio="xMidYMid meet" role="img">
+    <line x1="${padL}" y1="${padT + chartH}" x2="${W - padR}" y2="${padT + chartH}" stroke="#e2e8f0"/>
+    ${bars}
+    <polyline points="${poly}" fill="none" stroke="#334155" stroke-width="1.5" stroke-dasharray="3 3" opacity="0.5"/>
     ${labels}
   </svg>`;
 }
@@ -349,41 +403,36 @@ function vencMesTable(m) {
   </tbody></table>`;
 }
 
-// ── "quanto cabe comprar" — semana a semana até dezembro ──
+// ── "quanto cabe comprar" — mês a mês até dezembro ──
 function cabeComprarSection(m) {
   let acc = 0;
-  const rows = m.fluxo.map(f => {
-    const compromisso = f.sai;                 // a-pagar ERP + parcela Caixa
-    const sobra = f.entra - compromisso;       // espaço p/ comprar mercadoria
-    acc += sobra;
-    return { k: f.k, entra: f.entra, compromisso, caixa: f.caixa, sobra, acc };
-  });
-  const totalSobra = rows.reduce((s, r) => s + r.sobra, 0);
-  const apertos = rows.filter(r => r.sobra < 0).length;
-  const caixaTotal = m.fluxo.reduce((s, f) => s + (f.caixa || 0), 0);
-  let mesAnt = "";
+  const rows = m.mensal.map(mm => { acc += mm.cabe; return { ...mm, acc }; });
+  const totalCabe = rows.reduce((s, r) => s + r.cabe, 0);
+  const apertos = rows.filter(r => r.cabe < 0).length;
+  const temReserva = rows.some(r => r.fixoEsp > r.fixoLanc + 1);
+  const caixaTotal = rows.reduce((s, r) => s + (r.caixa || 0), 0);
   const trs = rows.map(r => {
-    const mesK = r.k.slice(0, 7);
-    const divisor = mesK !== mesAnt ? ` div` : "";
-    mesAnt = mesK;
-    const neg = r.sobra < 0;
+    const neg = r.cabe < 0;
+    const reservado = r.fixoEsp > r.fixoLanc + 1;
+    const compr = r.outros + r.caixa;
     const caixaTip = r.caixa > 0 ? ` title="inclui parcela Caixa ${fmt(r.caixa)}"` : "";
-    return `<tr class="${neg ? "cc-neg" : ""}${divisor}">
-      <td>${divisor ? `<b>${MESES_PT[+mesK.slice(5) - 1]}</b> ` : ""}${semLabel(r.k)}</td>
+    return `<tr class="${neg ? "cc-neg" : ""}">
+      <td><b>${mesLabelYM(r.ym)}</b>${r.emCurso ? " <span class='tag'>em curso</span>" : ""}</td>
       <td class="num ok">${fmt(r.entra)}</td>
-      <td class="num crit"${caixaTip}>${fmt(r.compromisso)}${r.caixa > 0 ? " *" : ""}</td>
-      <td class="num" style="font-weight:700;color:${neg ? "var(--crit)" : "var(--ok)"}">${fmt(r.sobra)}</td>
+      <td class="num" style="color:var(--warn)" title="${reservado ? `reservado (piso do último mês fechado); lançado no ERP até agora: ${fmt(r.fixoLanc)}` : "custo fixo já lançado no mês"}">${fmt(r.fixoEsp)}${reservado ? " <span class='rsv'>reserva</span>" : ""}</td>
+      <td class="num crit"${caixaTip}>${fmt(compr)}${r.caixa > 0 ? " *" : ""}</td>
+      <td class="num" style="font-weight:700;color:${neg ? "var(--crit)" : "var(--ok)"}">${fmt(r.cabe)}</td>
       <td class="num" style="color:${r.acc < 0 ? "var(--crit)" : "var(--muted)"}">${fmt(r.acc)}</td>
     </tr>`;
   }).join("");
   return `<section class="card">
-    <div class="card-h"><h3>Quanto cabe comprar — até dez</h3>
-      <span class="pill ${totalSobra >= 0 ? "warn" : "crit"}">${fmt(totalSobra)} no total</span></div>
-    <div class="cc-lead">Espaço entre a <b>entrada líquida</b> (venda projetada menos taxa de cartão) e o <b>compromisso já assumido</b> (contas a pagar + parcela da Caixa). É o teto do que dá pra comprar de mercadoria em cada semana sem apertar o caixa.</div>
+    <div class="card-h"><h3>Quanto cabe comprar — mês a mês, até dez</h3>
+      <span class="pill ${totalCabe >= 0 ? "warn" : "crit"}">${fmt(totalCabe)} no total</span></div>
+    <div class="cc-lead">Espaço entre a <b>entrada líquida</b> (venda projetada − taxa de cartão) e os <b>compromissos do mês</b>: custo fixo${temReserva ? " (reservado — ver abaixo)" : ""} + contas já lançadas + parcela da Caixa. É o teto do que dá pra comprar de mercadoria em cada mês sem apertar o caixa.</div>
     <div class="tbl-scroll"><table class="tbl cc-tbl"><thead><tr>
-      <th>Semana</th><th class="num">Entrada líq.</th><th class="num">Compromisso</th><th class="num">Cabe comprar</th><th class="num">Caixa acum.</th>
+      <th>Mês</th><th class="num">Entrada líq.</th><th class="num">Custo fixo</th><th class="num">Contas + Caixa</th><th class="num">Cabe comprar</th><th class="num">Caixa acum.</th>
     </tr></thead><tbody>${trs}</tbody></table></div>
-    <div class="note small">${apertos > 0 ? `<b class="crit">${apertos} semana(s)</b> com compromisso acima da entrada — nessas, não abrir compra nova. ` : ""}O <b>custo fixo dos meses à frente ainda não lançado</b> vai ocupar parte desse espaço. ${caixaTotal > 0 ? `<b>*</b> parcela da Caixa (dia 16, paga por fora do ERP). ` : ""}Dez pode ter contas a pagar ainda não lançadas — o teto real tende a ser menor.</div>
+    <div class="note small">${apertos > 0 ? `<b class="crit">${apertos} mês(es)</b> com compromisso acima da entrada — aí não abrir compra nova. ` : ""}${temReserva ? `<b class="rsv">reserva</b> = custo fixo dos meses à frente ainda não lançado no ERP; reservo o piso do último mês fechado (aluguel, folha e energia entram todo mês). ` : ""}${caixaTotal > 0 ? `<b>*</b> inclui a parcela da Caixa (dia 16, fora do ERP). ` : ""}Mercadoria que sai do estoque não é paga no mês — este é um teto de caixa, não de margem.</div>
   </section>`;
 }
 
@@ -407,10 +456,18 @@ function tabContent(m, isGrupo) {
 
   <div class="grid2">
     <section class="card wide">
-      <div class="card-h"><h3>Fluxo de caixa — ${m.fluxo.length} semanas, até dez/${String(now.getFullYear()).slice(2)}</h3>
-        <span class="legend"><i class="dot g"></i>Entra (venda líq. de cartão) <i class="dot r"></i>Sai (a pagar) <i class="dash"></i>saldo acumulado</span></div>
-      ${svgFluxo(m.fluxo, m.key)}
-      <div class="note">${apertos > 0 ? `<b class="crit">${apertos} semana(s)</b> com compromissos acima da entrada líquida — semanas de aperto.` : "Em nenhuma semana os compromissos superam a entrada líquida — caixa folgado."} <b>Entra</b> = faturamento projetado ${TEM_SAZONAL ? "com <b>sazonalidade</b> (mês em curso pelo ritmo real; Set–Dez pela curva de 2025 × crescimento do ano)" : "pelo ritmo de vendas"}, <b>líquido da taxa de cartão</b> (−${fmtPct(CORTE_CARTAO * 100, 1)}); <b>Sai</b> = contas a pagar por vencimento + parcela da Caixa (dia 16).</div>
+      <div class="card-h"><h3>Fluxo de caixa — estimativa futura</h3>
+        <span class="toggle"><button class="tg on" onclick="fluxoView('${m.key}','sem',this)">Semana</button><button class="tg" onclick="fluxoView('${m.key}','mes',this)">Mês</button></span></div>
+      <div id="fx-sem-${m.key}">
+        <div class="legend legend-row"><i class="dot g"></i>Entra (venda líq. de cartão) <i class="dot r"></i>Sai (a pagar) <i class="dash"></i>saldo acumulado</div>
+        ${svgFluxo(m.fluxo, m.key)}
+        <div class="note">${apertos > 0 ? `<b class="crit">${apertos} semana(s)</b> com compromissos acima da entrada líquida — semanas de aperto.` : "Em nenhuma semana os compromissos superam a entrada líquida — caixa folgado."} <b>Entra</b> = faturamento projetado ${TEM_SAZONAL ? "com <b>sazonalidade</b> (mês em curso pelo ritmo real; Set–Dez pela curva de 2025 × crescimento do ano)" : "pelo ritmo de vendas"}, <b>líquido da taxa de cartão</b> (−${fmtPct(CORTE_CARTAO * 100, 1)}); <b>Sai</b> = contas a pagar por vencimento (só o já lançado) + parcela da Caixa.</div>
+      </div>
+      <div id="fx-mes-${m.key}" style="display:none">
+        <div class="legend legend-row"><i class="dot g"></i>Entra líquida <i class="dot r"></i>Compromisso (custo fixo reservado) <i class="dash"></i>caixa acumulado · <b>nº acima da barra = cabe comprar</b></div>
+        ${svgFluxoMensal(m.mensal, m.key)}
+        <div class="note"><b>Visão mensal</b> — a diferença barra verde − vermelha é o <b>quanto cabe comprar</b> no mês (repetido acima de cada barra). Aqui o compromisso já <b>reserva o custo fixo cheio</b> dos meses à frente, então casa com a tabela abaixo. Compare com o <b>Faturamento mensal</b> ao lado: aquele é o realizado; este é a estimativa futura.</div>
+      </div>
     </section>
 
     <section class="card">
@@ -536,6 +593,11 @@ const htmlFull = `${html}
   .callout{display:flex;gap:10px;align-items:flex-start;background:#fef2f2;border:1px solid #fecaca;border-left:3px solid var(--crit);border-radius:12px;padding:11px 15px;margin-bottom:16px;font-size:12.5px;color:#7f1d1d;box-shadow:var(--shadow)}
   .callout-i{font-size:15px;line-height:1.3}
   .cc-lead{font-size:12px;color:var(--muted);margin-bottom:12px;line-height:1.5}
+  .toggle{display:inline-flex;background:#f1f5f9;border-radius:9px;padding:2px;gap:2px}
+  .tg{border:none;background:none;padding:5px 12px;border-radius:7px;font-size:12px;font-weight:600;color:var(--muted);cursor:pointer;font-family:inherit}
+  .tg.on{background:var(--card);color:var(--accent);box-shadow:0 1px 2px rgba(15,23,42,.08)}
+  .legend-row{margin-bottom:8px}
+  .rsv{display:inline-block;font-size:9px;background:#fffbeb;color:var(--warn);padding:0 5px;border-radius:4px;font-weight:700;vertical-align:middle}
   .tbl-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
   .cc-tbl td{white-space:nowrap}
   .cc-tbl tr.div td{border-top:2px solid var(--border)}
@@ -590,6 +652,11 @@ const htmlFull = `${html}
     document.getElementById('pane-'+k).style.display='block';
     document.querySelector('.tab[data-tab="'+k+'"]').classList.add('active');
     window.scrollTo({top:0,behavior:'smooth'});
+  }
+  function fluxoView(key,modo,btn){
+    document.getElementById('fx-sem-'+key).style.display = modo==='sem'?'block':'none';
+    document.getElementById('fx-mes-'+key).style.display = modo==='mes'?'block':'none';
+    const wrap=btn.parentElement; wrap.querySelectorAll('.tg').forEach(b=>b.classList.remove('on')); btn.classList.add('on');
   }
   async function atualizarAgora(e){e.preventDefault();
     const U="https://valhewbvjwdkkvuejrxa.supabase.co";
