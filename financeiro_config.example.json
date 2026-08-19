@@ -1,0 +1,7 @@
+{
+  "_comentario": "Copie para financeiro_config.json (gitignored) e preencha. Valores privados NÃO entram no repo público.",
+  "taxaCartao": 0.0268,
+  "shareCartao": 0.45,
+  "caixaParcela": { "valor": 0, "dia": 16, "lojas": ["L1", "L4"] },
+  "dividaInterna": null
+}

@@ -5,3 +5,6 @@ node_modules/
 financeiro_raw.json
 fat_*.json
 RUNBOOK_FINANCEIRO.md
+
+financeiro_config.json
+!financeiro_config.example.json

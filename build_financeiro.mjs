@@ -74,10 +74,68 @@ const BUCKETS = [
   { key: "financiamento", label: "Financiamento", cor: "#14b8a6" },
   { key: "outros", label: "Serviços & outros", cor: "#94a3b8" },
 ];
+// custo fixo = folha + ocupação/estrutura + serviços (NÃO mercadoria, NÃO impostos variáveis, NÃO financiamento)
+const FIXO_BUCKETS = new Set(["pessoal", "estrutura", "outros"]);
+
+// ── config SENSÍVEL (fora do repo público; ver financeiro_config.example.json) ──
+// Este script vai pro GitHub público, então valores privados (parcela de financiamento,
+// dívida entre lojas) NÃO ficam aqui — vêm de financeiro_config.json (gitignored).
+const CFG = (() => { try { return rd("financeiro_config.json"); } catch { return {}; } })();
+
+// ── ENTRADA LÍQUIDA: desconto de cartão ──────────────────────────────────────
+// O grupo antecipa 100% em D+1, mas a maquininha cobra taxa. Fonte da taxa: dashboard
+// de Conferência de Caixa, bloco "Taxa efetiva por plano" (média ponderada real).
+const TAXA_CARTAO = CFG.taxaCartao ?? 0.0268;    // taxa efetiva média ponderada (default 2,68%)
+const SHARE_CARTAO = CFG.shareCartao ?? 0.45;    // fatia do faturamento em cartão (default 45%)
+const CORTE_CARTAO = SHARE_CARTAO * TAXA_CARTAO; // ≈ 1,2% sobre o faturamento total
+const liquido = bruto => bruto * (1 - CORTE_CARTAO);
+
+// ── compromissos que o ERP NÃO enxerga (valores só no config gitignored) ─────
+// Financiamento Caixa Econômica de Altamira (L1+L4), pago por fora do ERP, dia fixo.
+const CAIXA_PARCELA = CFG.caixaParcela || null;  // { valor, dia, lojas:[...] } ou null (desliga)
+// Dívida entre lojas (única vencida do grupo). Não aparece no ERP.
+const DIVIDA_INTERNA = CFG.dividaInterna || null; // { devedor, credor, total, vencido, desde } ou null
+
+// ── faturamento mensal COMPLETO de 2025 (12 meses) p/ sazonalidade do Q4 ──────
+// Arquivo de dado (gitignored). Se ausente, a projeção cai no ritmo achatado (fallback honesto).
+const fat25full = (() => { try { return rd("fat_2025_full.json"); } catch { return null; } })();
+const TEM_SAZONAL = !!(fat25full && fat25full.L1 && fat25full.L1.length >= 12);
+const somaN = (arr, n) => (arr || []).slice(0, n).reduce((s, v) => s + (v || 0), 0);
+// crescimento YTD por loja (meses fechados Jan–Jul: índices 0..6) = 2026 / 2025
+function crescLoja(key) {
+  if (!TEM_SAZONAL) return 1;
+  const a = somaN(fat26[key], 7), b = somaN(fat25full[key], 7);
+  return b > 0 ? a / b : 1;
+}
+// projeção de faturamento de um mês futuro de 2026 = faturamento 2025 daquele mês × crescimento
+function projMesLoja(key, mes1a12) {
+  if (!TEM_SAZONAL) return 0;
+  return (fat25full[key][mes1a12 - 1] || 0) * crescLoja(key);
+}
+const diasNoMes = (y, m) => new Date(y, m, 0).getDate(); // m 1-12
+function diasDaSemana(k) { const [y, m, d] = k.split("-").map(Number); const out = []; let dt = new Date(y, m - 1, d); for (let i = 0; i < 7; i++) { out.push(dt); dt = new Date(dt.getFullYear(), dt.getMonth(), dt.getDate() + 1); } return out; }
+// entrada BRUTA projetada da semana p/ uma loja: mês corrente = ritmo real; meses à frente = projeção sazonal
+function entradaBrutaSemanaLoja(key, k, ritmoDia) {
+  let g = 0;
+  for (const dt of diasDaSemana(k)) {
+    const ym = `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}`;
+    if (ym < MES_ATUAL) continue;                    // dia já passado
+    if (ym === MES_ATUAL || !TEM_SAZONAL) { g += ritmoDia; continue; } // mês em curso (ou sem base 2025): ritmo real
+    const mesN = dt.getMonth() + 1;
+    g += projMesLoja(key, mesN) / diasNoMes(dt.getFullYear(), mesN);   // futuro: run-rate sazonal
+  }
+  return g;
+}
+// metade da parcela da Caixa (L1+L4) se o dia 16 cai nesta semana e a loja participa
+function caixaSemanaLoja(key, k) {
+  if (!CAIXA_PARCELA || !CAIXA_PARCELA.lojas.includes(key)) return 0;
+  return diasDaSemana(k).some(dt => dt.getDate() === CAIXA_PARCELA.dia) ? CAIXA_PARCELA.valor / CAIXA_PARCELA.lojas.length : 0;
+}
 
 // ── semanas do fluxo: da segunda desta semana, 13 semanas ──
 function segundaISO(d) { const dow = (d.getDay() + 6) % 7; const s = new Date(d); s.setDate(d.getDate() - dow); return `${s.getFullYear()}-${pad(s.getMonth() + 1)}-${pad(s.getDate())}`; }
-const SEMANAS = (() => { const arr = []; let s = new Date(now); const dow = (s.getDay() + 6) % 7; s.setDate(s.getDate() - dow); for (let i = 0; i < 13; i++) { const k = `${s.getFullYear()}-${pad(s.getMonth() + 1)}-${pad(s.getDate())}`; arr.push(k); s.setDate(s.getDate() + 7); } return arr; })();
+// da segunda desta semana até a semana que contém 31/dez (alcança o Q4 inteiro)
+const SEMANAS = (() => { const arr = []; let s = new Date(now); const dow = (s.getDay() + 6) % 7; s.setDate(s.getDate() - dow); const fim = new Date(now.getFullYear(), 11, 31); while (s <= fim) { arr.push(`${s.getFullYear()}-${pad(s.getMonth() + 1)}-${pad(s.getDate())}`); s.setDate(s.getDate() + 7); } return arr; })();
 const semLabel = k => { const [y, m, d] = k.split("-"); return `${d}/${m}`; };
 
 // ── modelo por loja ──
@@ -101,14 +159,34 @@ function modeloLoja(key, idx) {
   const pagarMesAnt = (pagar.porMes[MES_ANT] || {}).total || 0;
   const resAtual = fatAtual - pagarMes;
   const resAnt = fatAnt - pagarMesAnt;
-  // fluxo semanal: SAI = contas a pagar por vencimento (real); ENTRA = projeção pelo ritmo de vendas
-  const fluxo = SEMANAS.map(k => ({ k, sai: pagar.porSemana[k] || 0, entra: ritmoDia * 7 }));
+  // FATURAS PAGAS (saída real de caixa) por mês de pagamento
+  const pagoPorMes = (raw.pago && raw.pago.porMes) || {};
+  const pagoMesAtual = pagoPorMes[MES_ATUAL] || 0;
+  const pagoMesAnt = pagoPorMes[MES_ANT] || 0;
+  // CUSTO FIXO por mês = já pago (fixo, meses passados) + a vencer com Centro de Custo = Custo Fixo (cc=3, meses à frente).
+  // Meses passados: das faturas pagas, categorias fixas (folha+ocupação+serviços). Futuros: filtro cc=3 do a-pagar (o que o usuário usa).
+  const catPorMes = (raw.pago && raw.pago.catPorMes) || {};
+  const cfAberto = (raw.custoFixoAberto && raw.custoFixoAberto.porMes) || {};
+  const custoFixoPorMes = {};
+  for (const mk of new Set([...Object.keys(catPorMes), ...Object.keys(cfAberto)])) {
+    const pagoFixo = (catPorMes[mk] || []).filter(c => FIXO_BUCKETS.has(bucketOf(c.nome))).reduce((s, c) => s + c.valor, 0);
+    custoFixoPorMes[mk] = r0(pagoFixo + (cfAberto[mk] || 0));
+  }
+  // fluxo semanal: ENTRA = faturamento projetado (sazonal) LÍQUIDO de cartão; SAI = a-pagar por vencimento + parcela Caixa
+  const fluxo = SEMANAS.map(k => {
+    const saiErp = pagar.porSemana[k] || 0;
+    const caixa = caixaSemanaLoja(key, k);
+    const entraBruta = entradaBrutaSemanaLoja(key, k, ritmoDia);
+    const entra = liquido(entraBruta);
+    return { k, sai: saiErp + caixa, saiErp, caixa, entraBruta, entra };
+  });
   return {
     key, meses, serie26, serie25, iAtual, fatAtual, fatAnt, fat25Atual, ritmoDia,
     buckets, totalDespesa,
     pagarAberto: pagar.abertoValor, pagarAtrasado: pagar.atrasadoValor, pagarAtrasadoQtd: pagar.atrasadoQtd,
     receberAberto: receber.abertoValor, receberAtrasado: receber.atrasadoValor, receberAtrasadoQtd: receber.atrasadoQtd,
     pagarMes, pagarMesAnt, resAtual, resAnt,
+    pagoPorMes, pagoMesAtual, pagoMesAnt, custoFixoPorMes,
     pagarPorMes: pagar.porMes, receberPorMes: receber.porMes,
     topFornecedores: pagar.topContrapartes, topClientes: receber.topContrapartes,
     fluxo, pctMercadoria: pct(buckets.mercadoria, totalDespesa),
@@ -118,10 +196,11 @@ const M = {}; LOJAS.forEach((l, i) => { M[l.key] = modeloLoja(l.key, i); });
 
 // grupo consolidado
 function modeloGrupo() {
-  const g = { buckets: {}, fluxo: SEMANAS.map(k => ({ k, sai: 0, entra: 0 })), pagarPorMes: {}, receberPorMes: {} };
+  const g = { buckets: {}, fluxo: SEMANAS.map(k => ({ k, sai: 0, saiErp: 0, caixa: 0, entra: 0, entraBruta: 0 })), pagarPorMes: {}, receberPorMes: {}, pagoPorMes: {}, custoFixoPorMes: {} };
   for (const b of BUCKETS) g.buckets[b.key] = 0;
   let fatAtual = 0, fatAnt = 0, fat25Atual = 0, pagarAberto = 0, pagarAtrasado = 0, pagarAtrasadoQtd = 0,
-    receberAberto = 0, receberAtrasado = 0, receberAtrasadoQtd = 0, pagarMes = 0, pagarMesAnt = 0, totalDespesa = 0;
+    receberAberto = 0, receberAtrasado = 0, receberAtrasadoQtd = 0, pagarMes = 0, pagarMesAnt = 0, totalDespesa = 0,
+    pagoMesAtual = 0, pagoMesAnt = 0;
   const serie26 = fat26.meses.map(() => 0), serie25 = fat26.meses.map(() => 0);
   let ritmoDia = 0;
   for (const l of LOJAS) {
@@ -130,10 +209,13 @@ function modeloGrupo() {
     pagarAberto += m.pagarAberto; pagarAtrasado += m.pagarAtrasado; pagarAtrasadoQtd += m.pagarAtrasadoQtd;
     receberAberto += m.receberAberto; receberAtrasado += m.receberAtrasado; receberAtrasadoQtd += m.receberAtrasadoQtd;
     pagarMes += m.pagarMes; pagarMesAnt += m.pagarMesAnt; totalDespesa += m.totalDespesa;
+    pagoMesAtual += m.pagoMesAtual; pagoMesAnt += m.pagoMesAnt;
+    for (const [k, v] of Object.entries(m.pagoPorMes)) g.pagoPorMes[k] = (g.pagoPorMes[k] || 0) + (v || 0);
+    for (const [k, v] of Object.entries(m.custoFixoPorMes)) g.custoFixoPorMes[k] = (g.custoFixoPorMes[k] || 0) + (v || 0);
     for (const b of BUCKETS) g.buckets[b.key] += m.buckets[b.key];
     m.serie26.forEach((v, i) => serie26[i] += v);
     m.serie25.forEach((v, i) => serie25[i] += v);
-    m.fluxo.forEach((f, i) => { g.fluxo[i].sai += f.sai; g.fluxo[i].entra += f.entra; });
+    m.fluxo.forEach((f, i) => { g.fluxo[i].sai += f.sai; g.fluxo[i].saiErp += f.saiErp; g.fluxo[i].caixa += f.caixa; g.fluxo[i].entra += f.entra; g.fluxo[i].entraBruta += f.entraBruta; });
     for (const [k, v] of Object.entries(m.pagarPorMes)) { g.pagarPorMes[k] = g.pagarPorMes[k] || { total: 0 }; g.pagarPorMes[k].total += v.total; }
     for (const [k, v] of Object.entries(m.receberPorMes)) { g.receberPorMes[k] = g.receberPorMes[k] || { total: 0 }; g.receberPorMes[k].total += v.total; }
   }
@@ -149,6 +231,7 @@ function modeloGrupo() {
     fatAtual, fatAnt, fat25Atual, buckets: g.buckets, totalDespesa,
     pagarAberto, pagarAtrasado, pagarAtrasadoQtd, receberAberto, receberAtrasado, receberAtrasadoQtd,
     pagarMes, pagarMesAnt, resAtual: fatAtual - pagarMes, resAnt: fatAnt - pagarMesAnt,
+    pagoMesAtual, pagoMesAnt, pagoPorMes: g.pagoPorMes, custoFixoPorMes: g.custoFixoPorMes,
     pagarPorMes: g.pagarPorMes, receberPorMes: g.receberPorMes,
     topFornecedores: topForn, topClientes: topCli, fluxo: g.fluxo, pctMercadoria: pct(g.buckets.mercadoria, totalDespesa),
   };
@@ -224,7 +307,6 @@ function listaTop(items, tipo) {
 
 function kpiCards(m) {
   const yo = m.fat25Atual ? pct(m.fatAtual - m.fat25Atual, m.fat25Atual) : 0;
-  const saldoLiq = m.receberAberto - m.pagarAberto;
   const projMes = m.ritmoDia * 30;
   return `<div class="kpis">
     <div class="kpi">
@@ -238,19 +320,10 @@ function kpiCards(m) {
       <div class="kpi-s muted">projeção do mês ≈ ${fmtK(projMes)}</div>
     </div>
     <div class="kpi">
-      <div class="kpi-t">A pagar (em aberto)</div>
-      <div class="kpi-v">${fmt(m.pagarAberto)}</div>
+      <div class="kpi-t">Contas a pagar</div>
+      <div class="kpi-v">${fmt(m.pagarAberto)} <span style="font-size:12px;font-weight:600;color:var(--muted)">a vencer</span></div>
       <div class="kpi-s ${m.pagarAtrasado > 0 ? "down" : "muted"}">${m.pagarAtrasado > 0 ? `⚠ ${fmt(m.pagarAtrasado)} vencido (${m.pagarAtrasadoQtd})` : "nada vencido"}</div>
-    </div>
-    <div class="kpi">
-      <div class="kpi-t">A receber (em aberto)</div>
-      <div class="kpi-v">${fmt(m.receberAberto)}</div>
-      <div class="kpi-s muted">cartão + crediário a compensar</div>
-    </div>
-    <div class="kpi">
-      <div class="kpi-t">Saldo a receber − a pagar</div>
-      <div class="kpi-v ${saldoLiq >= 0 ? "ok" : "crit"}">${fmt(saldoLiq)}</div>
-      <div class="kpi-s muted">posição líquida em aberto</div>
+      <div class="kpi-s ok" style="margin-top:4px">✓ ${fmt(m.pagoMesAtual)} já pago em ${mesNome(MES_ATUAL)}</div>
     </div>
     <div class="kpi">
       <div class="kpi-t">Mercadoria / total a pagar</div>
@@ -261,28 +334,83 @@ function kpiCards(m) {
 }
 
 function vencMesTable(m) {
-  // meses ordenados presentes em pagar/receber
-  const keys = [...new Set([...Object.keys(m.pagarPorMes), ...Object.keys(m.receberPorMes)])].sort();
-  return `<table class="tbl"><thead><tr><th>Mês (vencimento)</th><th>Recebíveis agendados</th><th>A pagar</th><th>Saldo agendado</th></tr></thead><tbody>
+  // meses = união dos que têm pago (passado) e a pagar (futuro)
+  const keys = [...new Set([...Object.keys(m.pagoPorMes || {}), ...Object.keys(m.pagarPorMes)])].sort();
+  const cf = m.custoFixoPorMes || {};
+  return `<table class="tbl"><thead><tr><th>Mês</th><th class="num">Custo fixo</th><th class="num">Já pago</th><th class="num">A vencer</th><th class="num">Total</th></tr></thead><tbody>
     ${keys.map(k => {
-    const e = (m.receberPorMes[k] || {}).total || 0, s = (m.pagarPorMes[k] || {}).total || 0; const sal = e - s;
+    const fixo = cf[k] || 0;
+    const pg = (m.pagoPorMes || {})[k] || 0;
+    const s = (m.pagarPorMes[k] || {}).total || 0;
+    const tot = pg + s;
     const cur = k === MES_ATUAL ? ' class="cur"' : "";
-    return `<tr${cur}><td>${mesNome(k)}${k === MES_ATUAL ? " <span class='tag'>atual</span>" : ""}</td><td class="num ok">${fmt(e)}</td><td class="num crit">${fmt(s)}</td><td class="num ${sal >= 0 ? "ok" : "crit"}">${fmt(sal)}</td></tr>`;
+    return `<tr${cur}><td>${mesNome(k)}${k === MES_ATUAL ? " <span class='tag'>atual</span>" : ""}</td><td class="num" style="color:var(--warn)">${fixo > 0 ? fmt(fixo) : "—"}</td><td class="num ok">${pg > 0 ? fmt(pg) : "—"}</td><td class="num crit">${s > 0 ? fmt(s) : "—"}</td><td class="num"><b>${tot > 0 ? fmt(tot) : "—"}</b></td></tr>`;
   }).join("")}
   </tbody></table>`;
+}
+
+// ── "quanto cabe comprar" — semana a semana até dezembro ──
+function cabeComprarSection(m) {
+  let acc = 0;
+  const rows = m.fluxo.map(f => {
+    const compromisso = f.sai;                 // a-pagar ERP + parcela Caixa
+    const sobra = f.entra - compromisso;       // espaço p/ comprar mercadoria
+    acc += sobra;
+    return { k: f.k, entra: f.entra, compromisso, caixa: f.caixa, sobra, acc };
+  });
+  const totalSobra = rows.reduce((s, r) => s + r.sobra, 0);
+  const apertos = rows.filter(r => r.sobra < 0).length;
+  const caixaTotal = m.fluxo.reduce((s, f) => s + (f.caixa || 0), 0);
+  let mesAnt = "";
+  const trs = rows.map(r => {
+    const mesK = r.k.slice(0, 7);
+    const divisor = mesK !== mesAnt ? ` div` : "";
+    mesAnt = mesK;
+    const neg = r.sobra < 0;
+    const caixaTip = r.caixa > 0 ? ` title="inclui parcela Caixa ${fmt(r.caixa)}"` : "";
+    return `<tr class="${neg ? "cc-neg" : ""}${divisor}">
+      <td>${divisor ? `<b>${MESES_PT[+mesK.slice(5) - 1]}</b> ` : ""}${semLabel(r.k)}</td>
+      <td class="num ok">${fmt(r.entra)}</td>
+      <td class="num crit"${caixaTip}>${fmt(r.compromisso)}${r.caixa > 0 ? " *" : ""}</td>
+      <td class="num" style="font-weight:700;color:${neg ? "var(--crit)" : "var(--ok)"}">${fmt(r.sobra)}</td>
+      <td class="num" style="color:${r.acc < 0 ? "var(--crit)" : "var(--muted)"}">${fmt(r.acc)}</td>
+    </tr>`;
+  }).join("");
+  return `<section class="card">
+    <div class="card-h"><h3>Quanto cabe comprar — até dez</h3>
+      <span class="pill ${totalSobra >= 0 ? "warn" : "crit"}">${fmt(totalSobra)} no total</span></div>
+    <div class="cc-lead">Espaço entre a <b>entrada líquida</b> (venda projetada menos taxa de cartão) e o <b>compromisso já assumido</b> (contas a pagar + parcela da Caixa). É o teto do que dá pra comprar de mercadoria em cada semana sem apertar o caixa.</div>
+    <div class="tbl-scroll"><table class="tbl cc-tbl"><thead><tr>
+      <th>Semana</th><th class="num">Entrada líq.</th><th class="num">Compromisso</th><th class="num">Cabe comprar</th><th class="num">Caixa acum.</th>
+    </tr></thead><tbody>${trs}</tbody></table></div>
+    <div class="note small">${apertos > 0 ? `<b class="crit">${apertos} semana(s)</b> com compromisso acima da entrada — nessas, não abrir compra nova. ` : ""}O <b>custo fixo dos meses à frente ainda não lançado</b> vai ocupar parte desse espaço. ${caixaTotal > 0 ? `<b>*</b> parcela da Caixa (dia 16, paga por fora do ERP). ` : ""}Dez pode ter contas a pagar ainda não lançadas — o teto real tende a ser menor.</div>
+  </section>`;
+}
+
+// ── alerta da dívida interna L3 → L5 (única vencida do grupo) ──
+function dividaCallout(key) {
+  const d = DIVIDA_INTERNA;
+  if (!d) return "";
+  let txt = "";
+  if (key === "GRUPO") txt = `<b>${d.devedor} deve ${fmt(d.total)} à ${d.credor}</b> — ${fmt(d.vencido)} vencido desde ${d.desde}. É a única dívida vencida do grupo e não aparece no ERP.`;
+  else if (key === d.devedor) txt = `Esta loja <b>deve ${fmt(d.total)} à ${d.credor}</b> (Santarém) — ${fmt(d.vencido)} já vencido desde ${d.desde}. Dívida entre lojas, fora do ERP.`;
+  else if (key === d.credor) txt = `Esta loja tem <b>${fmt(d.total)} a receber da ${d.devedor}</b> (Itaituba) — ${fmt(d.vencido)} vencido desde ${d.desde}. Não aparece no ERP.`;
+  else return "";
+  return `<div class="callout"><span class="callout-i">⚠️</span><div>${txt}</div></div>`;
 }
 
 function tabContent(m, isGrupo) {
   const apertos = m.fluxo.filter(f => f.sai > f.entra).length;
   return `
+  ${dividaCallout(m.key)}
   ${kpiCards(m)}
 
   <div class="grid2">
     <section class="card wide">
-      <div class="card-h"><h3>Fluxo de caixa — próximas 13 semanas</h3>
-        <span class="legend"><i class="dot g"></i>Entra (ritmo de vendas) <i class="dot r"></i>Sai (a pagar) <i class="dash"></i>saldo acumulado</span></div>
+      <div class="card-h"><h3>Fluxo de caixa — ${m.fluxo.length} semanas, até dez/${String(now.getFullYear()).slice(2)}</h3>
+        <span class="legend"><i class="dot g"></i>Entra (venda líq. de cartão) <i class="dot r"></i>Sai (a pagar) <i class="dash"></i>saldo acumulado</span></div>
       ${svgFluxo(m.fluxo, m.key)}
-      <div class="note">${apertos > 0 ? `<b class="crit">${apertos} semana(s)</b> com contas a pagar acima do ritmo de vendas — semanas de aperto.` : "Em nenhuma semana as contas a pagar superam o ritmo de vendas — caixa folgado."} <b>Entra</b> = projeção pelo ritmo de vendas (${fmt(m.ritmoDia)}/dia); <b>Sai</b> = contas a pagar por data de vencimento (real). Recebíveis de cartão/crediário a compensar estão no painel "Maiores a receber".</div>
+      <div class="note">${apertos > 0 ? `<b class="crit">${apertos} semana(s)</b> com compromissos acima da entrada líquida — semanas de aperto.` : "Em nenhuma semana os compromissos superam a entrada líquida — caixa folgado."} <b>Entra</b> = faturamento projetado ${TEM_SAZONAL ? "com <b>sazonalidade</b> (mês em curso pelo ritmo real; Set–Dez pela curva de 2025 × crescimento do ano)" : "pelo ritmo de vendas"}, <b>líquido da taxa de cartão</b> (−${fmtPct(CORTE_CARTAO * 100, 1)}); <b>Sai</b> = contas a pagar por vencimento + parcela da Caixa (dia 16).</div>
     </section>
 
     <section class="card">
@@ -290,6 +418,8 @@ function tabContent(m, isGrupo) {
       ${serieMini(m)}
     </section>
   </div>
+
+  ${cabeComprarSection(m)}
 
   <div class="grid2">
     <section class="card">
@@ -299,23 +429,16 @@ function tabContent(m, isGrupo) {
     </section>
 
     <section class="card">
-      <div class="card-h"><h3>Calendário de vencimentos por mês</h3></div>
+      <div class="card-h"><h3>Contas a pagar por mês</h3></div>
       ${vencMesTable(m)}
-      <div class="note small">Só o que já está <b>agendado</b> no ERP. Recebíveis dos próximos meses crescem conforme novas vendas acontecem — por isso o saldo agendado futuro aparece negativo.</div>
+      <div class="note small"><b>Custo fixo</b> = centro de custo "Custo Fixo" do ERP (aluguel, folha, energia, sistemas, etc.), por mês. <b>Já pago</b> = saída real de caixa (por data de pagamento). <b>A vencer</b> = total em aberto por vencimento. <b>Total</b> = já pago + a vencer (todas as contas do mês).</div>
     </section>
   </div>
 
-  <div class="grid2">
-    <section class="card">
-      <div class="card-h"><h3>Maiores contas a pagar</h3>${m.pagarAtrasado > 0 ? `<span class="pill crit">${fmt(m.pagarAtrasado)} vencido</span>` : ""}</div>
-      ${listaTop(m.topFornecedores, "r")}
-    </section>
-    <section class="card">
-      <div class="card-h"><h3>Maiores a receber</h3>${m.receberAtrasado > 0 ? `<span class="pill warn">${fmt(m.receberAtrasado)} vencido/a compensar</span>` : ""}</div>
-      ${listaTop(m.topClientes, "g")}
-      <div class="note small">A maior parte é recebível de cartão (operadoras). "Vencido" aqui inclui parcelas ainda não baixadas no ERP — não é necessariamente inadimplência de cliente.</div>
-    </section>
-  </div>`;
+  <section class="card">
+    <div class="card-h"><h3>Maiores contas a pagar</h3>${m.pagarAtrasado > 0 ? `<span class="pill crit">${fmt(m.pagarAtrasado)} vencido</span>` : ""}</div>
+    ${listaTop(m.topFornecedores, "r")}
+  </section>`;
 }
 
 const TABS = [{ key: "GRUPO", label: "Grupo", sub: "consolidado", m: G }, ...LOJAS.map(l => ({ key: l.key, label: `${l.key} · ${l.cidade}`, sub: l.nome, m: M[l.key] }))];
@@ -325,7 +448,7 @@ const BUILD = Date.now();
 const CONTEUDO = `
   <div class="page-header">
     <div><h1>💰 Painel Financeiro — Grupo A.M. Gomes</h1>
-      <div class="subtitle">Contas a pagar, a receber, fluxo de caixa e resultado por loja · fonte: Microvix (ERP)</div></div>
+      <div class="subtitle">Contas a pagar, fluxo de caixa e estrutura de custos por loja · fonte: Microvix (ERP)</div></div>
     <div class="hstamp">Dados coletados em<br><b>${fin.geradoEmBR}</b>
       <br><a class="btn small" href="#" onclick="atualizarAgora(event)">⚡ Atualizar agora</a></div>
   </div>
@@ -399,6 +522,7 @@ const htmlFull = `${html}
   .spark-lbl{font-size:10px;color:var(--muted2);margin-top:4px}
   .tbl{width:100%;border-collapse:collapse;font-size:12px}
   .tbl th{text-align:left;color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.3px;padding:6px 8px;border-bottom:1px solid var(--border)}
+  .tbl th.num{text-align:right}
   .tbl td{padding:6px 8px;border-bottom:1px solid #f1f5f9}
   .tbl td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
   .tbl tr.cur{background:#eef2ff}
@@ -409,6 +533,13 @@ const htmlFull = `${html}
   .top-val{text-align:right;font-variant-numeric:tabular-nums;color:var(--text2)}
   .pill{font-size:10.5px;padding:2px 8px;border-radius:6px;font-weight:600}
   .pill.crit{background:#fef2f2;color:var(--crit)}.pill.warn{background:#fffbeb;color:var(--warn)}
+  .callout{display:flex;gap:10px;align-items:flex-start;background:#fef2f2;border:1px solid #fecaca;border-left:3px solid var(--crit);border-radius:12px;padding:11px 15px;margin-bottom:16px;font-size:12.5px;color:#7f1d1d;box-shadow:var(--shadow)}
+  .callout-i{font-size:15px;line-height:1.3}
+  .cc-lead{font-size:12px;color:var(--muted);margin-bottom:12px;line-height:1.5}
+  .tbl-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  .cc-tbl td{white-space:nowrap}
+  .cc-tbl tr.div td{border-top:2px solid var(--border)}
+  .cc-tbl tr.cc-neg{background:#fef2f2}
   .foot{text-align:center;color:var(--muted2);font-size:11px;margin:18px 0 6px}
   .lock{max-width:380px;margin:60px auto;background:var(--card);border:1px solid var(--border);border-top:3px solid var(--accent);border-radius:16px;padding:30px 28px;box-shadow:var(--shadow);text-align:center}
   .lock h2{font-size:17px;font-weight:800;margin-bottom:6px}
@@ -460,8 +591,15 @@ const htmlFull = `${html}
     document.querySelector('.tab[data-tab="'+k+'"]').classList.add('active');
     window.scrollTo({top:0,behavior:'smooth'});
   }
-  function atualizarAgora(e){e.preventDefault();
-    alert('Atualização sob demanda: peça ao Claude para rodar o pipeline, ou aguarde o horário fixo.');
+  async function atualizarAgora(e){e.preventDefault();
+    const U="https://valhewbvjwdkkvuejrxa.supabase.co";
+    const K="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZhbGhld2J2andka2t2dWVqcnhhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODE3MzEwMTgsImV4cCI6MjA5NzMwNzAxOH0.DhQaFpQ1Ca-W8Od6jl3KatGai_shXOoc14Fqk7P3lK4";
+    if(!confirm('Buscar os dados mais recentes do ERP agora? Leva ~5 minutos.')) return;
+    try{
+      const r=await fetch(U+"/rest/v1/financeiro_trigger?id=eq.1",{method:"PATCH",headers:{apikey:K,Authorization:"Bearer "+K,"Content-Type":"application/json"},body:JSON.stringify({solicitado_em:new Date().toISOString()})});
+      if(r.ok) alert('⚡ Pedido enviado! O painel vai coletar do ERP e se atualizar em ~5 minutos. Recarregue a página daqui a pouco.\\n\\n(Se o ERP estiver ocupado, tenta de novo sozinho.)');
+      else alert('Não consegui enviar o pedido agora (erro '+r.status+'). Tente de novo, ou aguarde a atualização automática das 19:55.');
+    }catch(err){ alert('Sem conexão pra enviar o pedido agora. Tente de novo. (O painel atualiza sozinho todo dia às 19:55.)'); }
   }
   (function(){try{const s=sessionStorage.getItem('fin_ok'); if(s) abrir(s).catch(()=>{});}catch(e){}})();
 </script>
