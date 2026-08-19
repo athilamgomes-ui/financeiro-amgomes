@@ -308,7 +308,7 @@ function svgFluxoMensal(mensal, id) {
     const hE = chartH * (m.entra / max), hC = chartH * (m.compromisso / max);
     bars += `<rect x="${(x + bw * 0.16).toFixed(1)}" y="${y(m.entra).toFixed(1)}" width="${w2.toFixed(1)}" height="${hE.toFixed(1)}" rx="3" fill="#10b981"><title>Entra ${mesLabelYM(m.ym)}: ${fmt(m.entra)}</title></rect>`;
     bars += `<rect x="${(x + bw * 0.54).toFixed(1)}" y="${y(m.compromisso).toFixed(1)}" width="${w2.toFixed(1)}" height="${hC.toFixed(1)}" rx="3" fill="#ef4444"><title>Compromisso ${mesLabelYM(m.ym)}: ${fmt(m.compromisso)}</title></rect>`;
-    labels += `<text x="${(x + bw / 2).toFixed(1)}" y="${padT - 9}" text-anchor="middle" font-size="10.5" fill="${m.cabe < 0 ? "#dc2626" : "#059669"}" font-weight="700"><title>cabe comprar</title>${fmtK(m.cabe)}</text>`;
+    labels += `<text x="${(x + bw / 2).toFixed(1)}" y="${padT - 9}" text-anchor="middle" font-size="10.5" fill="${m.cabe < 0 ? "#dc2626" : "#059669"}" font-weight="700"><title>sobra de caixa</title>${fmtK(m.cabe)}</text>`;
     const aperto = m.compromisso > m.entra;
     labels += `<text x="${(x + bw / 2).toFixed(1)}" y="${H - 16}" text-anchor="middle" font-size="11" fill="${aperto ? "#dc2626" : "#64748b"}" font-weight="${aperto ? 700 : 500}">${mesLabelYM(m.ym)}</text>`;
     sacc += m.cabe; linePts.push([x + bw / 2, sacc]);
@@ -403,39 +403,6 @@ function vencMesTable(m) {
   </tbody></table>`;
 }
 
-// ── "quanto cabe comprar" — mês a mês até dezembro ──
-function cabeComprarSection(m) {
-  let acc = 0;
-  const rows = m.mensal.map(mm => { acc += mm.cabe; return { ...mm, acc }; });
-  const totalCabe = rows.reduce((s, r) => s + r.cabe, 0);
-  const apertos = rows.filter(r => r.cabe < 0).length;
-  const temReserva = rows.some(r => r.fixoEsp > r.fixoLanc + 1);
-  const caixaTotal = rows.reduce((s, r) => s + (r.caixa || 0), 0);
-  const trs = rows.map(r => {
-    const neg = r.cabe < 0;
-    const reservado = r.fixoEsp > r.fixoLanc + 1;
-    const compr = r.outros + r.caixa;
-    const caixaTip = r.caixa > 0 ? ` title="inclui parcela Caixa ${fmt(r.caixa)}"` : "";
-    return `<tr class="${neg ? "cc-neg" : ""}">
-      <td><b>${mesLabelYM(r.ym)}</b>${r.emCurso ? " <span class='tag'>em curso</span>" : ""}</td>
-      <td class="num ok">${fmt(r.entra)}</td>
-      <td class="num" style="color:var(--warn)" title="${reservado ? `reservado (piso do último mês fechado); lançado no ERP até agora: ${fmt(r.fixoLanc)}` : "custo fixo já lançado no mês"}">${fmt(r.fixoEsp)}${reservado ? " <span class='rsv'>reserva</span>" : ""}</td>
-      <td class="num crit"${caixaTip}>${fmt(compr)}${r.caixa > 0 ? " *" : ""}</td>
-      <td class="num" style="font-weight:700;color:${neg ? "var(--crit)" : "var(--ok)"}">${fmt(r.cabe)}</td>
-      <td class="num" style="color:${r.acc < 0 ? "var(--crit)" : "var(--muted)"}">${fmt(r.acc)}</td>
-    </tr>`;
-  }).join("");
-  return `<section class="card">
-    <div class="card-h"><h3>Quanto cabe comprar — mês a mês, até dez</h3>
-      <span class="pill ${totalCabe >= 0 ? "warn" : "crit"}">${fmt(totalCabe)} no total</span></div>
-    <div class="cc-lead">Espaço entre a <b>entrada líquida</b> (venda projetada − taxa de cartão) e os <b>compromissos do mês</b>: custo fixo${temReserva ? " (reservado — ver abaixo)" : ""} + contas já lançadas + parcela da Caixa. É o teto do que dá pra comprar de mercadoria em cada mês sem apertar o caixa.</div>
-    <div class="tbl-scroll"><table class="tbl cc-tbl"><thead><tr>
-      <th>Mês</th><th class="num">Entrada líq.</th><th class="num">Custo fixo</th><th class="num">Contas + Caixa</th><th class="num">Cabe comprar</th><th class="num">Caixa acum.</th>
-    </tr></thead><tbody>${trs}</tbody></table></div>
-    <div class="note small">${apertos > 0 ? `<b class="crit">${apertos} mês(es)</b> com compromisso acima da entrada — aí não abrir compra nova. ` : ""}${temReserva ? `<b class="rsv">reserva</b> = custo fixo dos meses à frente ainda não lançado no ERP; reservo o piso do último mês fechado (aluguel, folha e energia entram todo mês). ` : ""}${caixaTotal > 0 ? `<b>*</b> inclui a parcela da Caixa (dia 16, fora do ERP). ` : ""}Mercadoria que sai do estoque não é paga no mês — este é um teto de caixa, não de margem.</div>
-  </section>`;
-}
-
 // ── alerta da dívida interna L3 → L5 (única vencida do grupo) ──
 function dividaCallout(key) {
   const d = DIVIDA_INTERNA;
@@ -464,9 +431,9 @@ function tabContent(m, isGrupo) {
         <div class="note">${apertos > 0 ? `<b class="crit">${apertos} semana(s)</b> com compromissos acima da entrada líquida — semanas de aperto.` : "Em nenhuma semana os compromissos superam a entrada líquida — caixa folgado."} <b>Entra</b> = faturamento projetado ${TEM_SAZONAL ? "com <b>sazonalidade</b> (mês em curso pelo ritmo real; Set–Dez pela curva de 2025 × crescimento do ano)" : "pelo ritmo de vendas"}, <b>líquido da taxa de cartão</b> (−${fmtPct(CORTE_CARTAO * 100, 1)}); <b>Sai</b> = contas a pagar por vencimento (só o já lançado) + parcela da Caixa.</div>
       </div>
       <div id="fx-mes-${m.key}" style="display:none">
-        <div class="legend legend-row"><i class="dot g"></i>Entra líquida <i class="dot r"></i>Compromisso (custo fixo reservado) <i class="dash"></i>caixa acumulado · <b>nº acima da barra = cabe comprar</b></div>
+        <div class="legend legend-row"><i class="dot g"></i>Entra líquida <i class="dot r"></i>Compromisso (custo fixo reservado) <i class="dash"></i>caixa acumulado · <b>nº acima da barra = sobra de caixa</b></div>
         ${svgFluxoMensal(m.mensal, m.key)}
-        <div class="note"><b>Visão mensal</b> — a diferença barra verde − vermelha é o <b>quanto cabe comprar</b> no mês (repetido acima de cada barra). Aqui o compromisso já <b>reserva o custo fixo cheio</b> dos meses à frente, então casa com a tabela abaixo. Compare com o <b>Faturamento mensal</b> ao lado: aquele é o realizado; este é a estimativa futura.</div>
+        <div class="note"><b>Visão mensal</b> — a diferença barra verde − vermelha é a <b>sobra de caixa</b> do mês (repetida acima de cada barra), já reservando o <b>custo fixo cheio</b> dos meses à frente (aluguel, folha, energia). <b>Compromisso</b> = custo fixo + contas já lançadas + parcela da Caixa. Compare com o <b>Faturamento mensal</b> ao lado: aquele é o realizado; este é a estimativa futura.</div>
       </div>
     </section>
 
@@ -475,8 +442,6 @@ function tabContent(m, isGrupo) {
       ${serieMini(m)}
     </section>
   </div>
-
-  ${cabeComprarSection(m)}
 
   <div class="grid2">
     <section class="card">
