@@ -34,6 +34,30 @@ const rd = f => JSON.parse(fs.readFileSync(path.join(DIR, f), "utf8"));
 const fin = rd("financeiro_raw.json");
 const fat26 = rd("fat_2026.json");
 const fat25 = rd("fat_2025.json");
+const r2c = n => Math.round((n || 0) * 100) / 100;
+
+// ── EM TRÂNSITO: pedidos ENVIADO/FATURADO ainda NÃO lançados no ERP (caixa já comprometido) ──
+// Espelho da tela de pedidos: ela grava o comprometido (já com anti-duplicação _noERP) em
+// pedidos_comprometido; aqui só lemos e mapeamos as praças p/ loja (Altamira ÷2 entre L1 e L4).
+const SB_URL = "https://valhewbvjwdkkvuejrxa.supabase.co";
+const SB_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZhbGhld2J2andka2t2dWVqcnhhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODE3MzEwMTgsImV4cCI6MjA5NzMwNzAxOH0.DhQaFpQ1Ca-W8Od6jl3KatGai_shXOoc14Fqk7P3lK4";
+async function fetchEmTransito() {
+  try {
+    const r = await fetch(`${SB_URL}/rest/v1/pedidos_comprometido?id=eq.1&select=dados,atualizado_em`,
+      { headers: { apikey: SB_ANON, Authorization: "Bearer " + SB_ANON }, signal: AbortSignal.timeout(12000) });
+    if (!r.ok) return null;
+    const row = (await r.json())[0];
+    const plm = row && row.dados && row.dados.porLojaMes;
+    if (!plm) return null;
+    const out = { L1: {}, L3: {}, L4: {}, L5: {} };
+    const add = (dst, obj, f = 1) => { for (const [mk, v] of Object.entries(obj || {})) dst[mk] = r2c((dst[mk] || 0) + v * f); };
+    add(out.L1, plm.ALTAMIRA, 0.5); add(out.L4, plm.ALTAMIRA, 0.5);  // Altamira = L1+L4 (½ cada)
+    add(out.L3, plm.ITAITUBA, 1); add(out.L5, plm.SANTAREM, 1);
+    return { porLoja: out, atualizadoEm: row.atualizado_em || null };
+  } catch { return null; }
+}
+const emTransito = await fetchEmTransito();
+const transitoEmBR = (emTransito && emTransito.atualizadoEm) ? new Date(emTransito.atualizadoEm).toLocaleString("pt-BR", { day: "2-digit", month: "2-digit", year: "2-digit", hour: "2-digit", minute: "2-digit" }) : null;
 
 // ── util ──
 const pad = n => String(n).padStart(2, "0");
@@ -166,15 +190,12 @@ function modeloLoja(key, idx) {
   const pagoPorMes = (raw.pago && raw.pago.porMes) || {};
   const pagoMesAtual = pagoPorMes[MES_ATUAL] || 0;
   const pagoMesAnt = pagoPorMes[MES_ANT] || 0;
-  // CUSTO FIXO por mês = já pago (fixo, meses passados) + a vencer com Centro de Custo = Custo Fixo (cc=3, meses à frente).
-  // Meses passados: das faturas pagas, categorias fixas (folha+ocupação+serviços). Futuros: filtro cc=3 do a-pagar (o que o usuário usa).
-  const catPorMes = (raw.pago && raw.pago.catPorMes) || {};
+  // CUSTO FIXO por mês = valor A VENCER com Centro de Custo = "Custo Fixo" (cc) do ERP.
+  // É EXATAMENTE o relatório Faturas a Pagar → Centro de Custo = Custo Fixo (o que o usuário confere).
+  // Meses já pagos não têm "a vencer" (o relatório não mostra pagas) → aparecem em "Já pago", não aqui.
   const cfAberto = (raw.custoFixoAberto && raw.custoFixoAberto.porMes) || {};
   const custoFixoPorMes = {};
-  for (const mk of new Set([...Object.keys(catPorMes), ...Object.keys(cfAberto)])) {
-    const pagoFixo = (catPorMes[mk] || []).filter(c => FIXO_BUCKETS.has(bucketOf(c.nome))).reduce((s, c) => s + c.valor, 0);
-    custoFixoPorMes[mk] = r0(pagoFixo + (cfAberto[mk] || 0));
-  }
+  for (const [mk, v] of Object.entries(cfAberto)) custoFixoPorMes[mk] = r0(v);
   // fluxo semanal: ENTRA = faturamento projetado (sazonal) LÍQUIDO de cartão; SAI = a-pagar por vencimento + parcela Caixa
   const fluxo = SEMANAS.map(k => {
     const saiErp = pagar.porSemana[k] || 0;
@@ -184,10 +205,9 @@ function modeloLoja(key, idx) {
     return { k, sai: saiErp + caixa, saiErp, caixa, entraBruta, entra };
   });
   // ── modelo MENSAL (mês corrente → dez): entrada líquida vs compromisso, com custo fixo RESERVADO ──
-  // Piso de custo fixo p/ meses à frente = maior custo fixo entre o último mês fechado e os 2 próximos
-  // (o lançado de meses distantes fica incompleto; reservar o nível recente evita superestimar a sobra).
-  // piso = custo fixo do último mês FECHADO (real, pago). Fallback: maior custo fixo lançado conhecido.
-  const baseFixo = (custoFixoPorMes[MES_ANT] || 0) || Math.max(0, ...Object.values(custoFixoPorMes));
+  // Piso = maior custo fixo (cc) já lançado entre os meses conhecidos — proxy do custo fixo mensal cheio.
+  // Meses distantes têm só o recorrente lançado (falta folha etc.); reservar o piso evita superestimar a sobra.
+  const baseFixo = Math.max(0, ...Object.values(custoFixoPorMes));
   const caixaMes = (CAIXA_PARCELA && CAIXA_PARCELA.lojas.includes(key)) ? CAIXA_PARCELA.valor / CAIXA_PARCELA.lojas.length : 0;
   const mensal = MESES_FLUXO.map(ym => {
     const y = +ym.slice(0, 4), mesN = +ym.slice(5);
@@ -201,8 +221,11 @@ function modeloLoja(key, idx) {
     const compromisso = fixoEsp + outros + caixaMes;
     return { ym, emCurso, entra, fixoEsp, fixoLanc, outros, caixa: caixaMes, compromisso, cabe: entra - compromisso };
   });
+  // em trânsito (pedidos não lançados no ERP) desta loja, por mês
+  const transitoPorMes = (emTransito && emTransito.porLoja[key]) || {};
+  const transitoTotal = Object.values(transitoPorMes).reduce((s, v) => s + v, 0);
   return {
-    mensal, baseFixo,
+    mensal, baseFixo, transitoPorMes, transitoTotal,
     key, meses, serie26, serie25, iAtual, fatAtual, fatAnt, fat25Atual, ritmoDia,
     buckets, totalDespesa,
     pagarAberto: pagar.abertoValor, pagarAtrasado: pagar.atrasadoValor, pagarAtrasadoQtd: pagar.atrasadoQtd,
@@ -218,7 +241,7 @@ const M = {}; LOJAS.forEach((l, i) => { M[l.key] = modeloLoja(l.key, i); });
 
 // grupo consolidado
 function modeloGrupo() {
-  const g = { buckets: {}, fluxo: SEMANAS.map(k => ({ k, sai: 0, saiErp: 0, caixa: 0, entra: 0, entraBruta: 0 })), mensal: MESES_FLUXO.map(ym => ({ ym, emCurso: ym === MES_ATUAL, entra: 0, fixoEsp: 0, fixoLanc: 0, outros: 0, caixa: 0, compromisso: 0, cabe: 0 })), pagarPorMes: {}, receberPorMes: {}, pagoPorMes: {}, custoFixoPorMes: {} };
+  const g = { buckets: {}, fluxo: SEMANAS.map(k => ({ k, sai: 0, saiErp: 0, caixa: 0, entra: 0, entraBruta: 0 })), mensal: MESES_FLUXO.map(ym => ({ ym, emCurso: ym === MES_ATUAL, entra: 0, fixoEsp: 0, fixoLanc: 0, outros: 0, caixa: 0, compromisso: 0, cabe: 0 })), pagarPorMes: {}, receberPorMes: {}, pagoPorMes: {}, custoFixoPorMes: {}, transitoPorMes: {} };
   for (const b of BUCKETS) g.buckets[b.key] = 0;
   let fatAtual = 0, fatAnt = 0, fat25Atual = 0, pagarAberto = 0, pagarAtrasado = 0, pagarAtrasadoQtd = 0,
     receberAberto = 0, receberAtrasado = 0, receberAtrasadoQtd = 0, pagarMes = 0, pagarMesAnt = 0, totalDespesa = 0,
@@ -234,6 +257,7 @@ function modeloGrupo() {
     pagoMesAtual += m.pagoMesAtual; pagoMesAnt += m.pagoMesAnt;
     for (const [k, v] of Object.entries(m.pagoPorMes)) g.pagoPorMes[k] = (g.pagoPorMes[k] || 0) + (v || 0);
     for (const [k, v] of Object.entries(m.custoFixoPorMes)) g.custoFixoPorMes[k] = (g.custoFixoPorMes[k] || 0) + (v || 0);
+    for (const [k, v] of Object.entries(m.transitoPorMes)) g.transitoPorMes[k] = r2c((g.transitoPorMes[k] || 0) + (v || 0));
     for (const b of BUCKETS) g.buckets[b.key] += m.buckets[b.key];
     m.serie26.forEach((v, i) => serie26[i] += v);
     m.serie25.forEach((v, i) => serie25[i] += v);
@@ -250,7 +274,7 @@ function modeloGrupo() {
   };
   const topForn = mergeTop("topFornecedores"), topCli = mergeTop("topClientes");
   return {
-    mensal: g.mensal,
+    mensal: g.mensal, transitoPorMes: g.transitoPorMes, transitoTotal: Object.values(g.transitoPorMes).reduce((s, v) => s + v, 0),
     key: "GRUPO", meses: fat26.meses, serie26, serie25, iAtual: fat26.meses.length - 1, ritmoDia,
     fatAtual, fatAnt, fat25Atual, buckets: g.buckets, totalDespesa,
     pagarAberto, pagarAtrasado, pagarAtrasadoQtd, receberAberto, receberAtrasado, receberAtrasadoQtd,
@@ -377,6 +401,7 @@ function kpiCards(m) {
       <div class="kpi-t">Contas a pagar</div>
       <div class="kpi-v">${fmt(m.pagarAberto)} <span style="font-size:12px;font-weight:600;color:var(--muted)">a vencer</span></div>
       <div class="kpi-s ${m.pagarAtrasado > 0 ? "down" : "muted"}">${m.pagarAtrasado > 0 ? `⚠ ${fmt(m.pagarAtrasado)} vencido (${m.pagarAtrasadoQtd})` : "nada vencido"}</div>
+      ${m.transitoTotal > 0 ? `<div class="kpi-s" style="color:#7c3aed;margin-top:4px">＋ ${fmt(m.transitoTotal)} em trânsito (pedidos)</div>` : ""}
       <div class="kpi-s ok" style="margin-top:4px">✓ ${fmt(m.pagoMesAtual)} já pago em ${mesNome(MES_ATUAL)}</div>
     </div>
     <div class="kpi">
@@ -388,17 +413,22 @@ function kpiCards(m) {
 }
 
 function vencMesTable(m) {
-  // meses = união dos que têm pago (passado) e a pagar (futuro)
-  const keys = [...new Set([...Object.keys(m.pagoPorMes || {}), ...Object.keys(m.pagarPorMes)])].sort();
+  const tr = m.transitoPorMes || {};
+  const temTransito = Object.values(tr).some(v => v > 0);
+  // meses = união dos que têm pago (passado), a pagar (futuro) e em trânsito
+  const keys = [...new Set([...Object.keys(m.pagoPorMes || {}), ...Object.keys(m.pagarPorMes), ...Object.keys(tr)])].sort();
   const cf = m.custoFixoPorMes || {};
-  return `<table class="tbl"><thead><tr><th>Mês</th><th class="num">Custo fixo</th><th class="num">Já pago</th><th class="num">A vencer</th><th class="num">Total</th></tr></thead><tbody>
+  const thTransito = temTransito ? `<th class="num">Em trânsito</th>` : "";
+  return `<table class="tbl"><thead><tr><th>Mês</th><th class="num">Custo fixo</th><th class="num">Já pago</th><th class="num">A vencer</th>${thTransito}<th class="num">Total</th></tr></thead><tbody>
     ${keys.map(k => {
     const fixo = cf[k] || 0;
     const pg = (m.pagoPorMes || {})[k] || 0;
     const s = (m.pagarPorMes[k] || {}).total || 0;
-    const tot = pg + s;
+    const t = tr[k] || 0;
+    const tot = pg + s + t;
     const cur = k === MES_ATUAL ? ' class="cur"' : "";
-    return `<tr${cur}><td>${mesNome(k)}${k === MES_ATUAL ? " <span class='tag'>atual</span>" : ""}</td><td class="num" style="color:var(--warn)">${fixo > 0 ? fmt(fixo) : "—"}</td><td class="num ok">${pg > 0 ? fmt(pg) : "—"}</td><td class="num crit">${s > 0 ? fmt(s) : "—"}</td><td class="num"><b>${tot > 0 ? fmt(tot) : "—"}</b></td></tr>`;
+    const tdTransito = temTransito ? `<td class="num" style="color:#7c3aed">${t > 0 ? fmt(t) : "—"}</td>` : "";
+    return `<tr${cur}><td>${mesNome(k)}${k === MES_ATUAL ? " <span class='tag'>atual</span>" : ""}</td><td class="num" style="color:var(--warn)">${fixo > 0 ? fmt(fixo) : "—"}</td><td class="num ok">${pg > 0 ? fmt(pg) : "—"}</td><td class="num crit">${s > 0 ? fmt(s) : "—"}</td>${tdTransito}<td class="num"><b>${tot > 0 ? fmt(tot) : "—"}</b></td></tr>`;
   }).join("")}
   </tbody></table>`;
 }
@@ -453,7 +483,7 @@ function tabContent(m, isGrupo) {
     <section class="card">
       <div class="card-h"><h3>Contas a pagar por mês</h3></div>
       ${vencMesTable(m)}
-      <div class="note small"><b>Custo fixo</b> = centro de custo "Custo Fixo" do ERP (aluguel, folha, energia, sistemas, etc.), por mês. <b>Já pago</b> = saída real de caixa (por data de pagamento). <b>A vencer</b> = total em aberto por vencimento. <b>Total</b> = já pago + a vencer (todas as contas do mês).</div>
+      <div class="note small"><b>Custo fixo</b> = relatório <i>Faturas a Pagar → Centro de Custo = Custo Fixo</i> do ERP, valor <b>a vencer</b> por mês (bate 1:1 com o ERP; aluguel, folha, energia, sistemas…). Mês já pago não tem "a vencer" — aparece em "Já pago". <b>Já pago</b> = saída real de caixa. <b>A vencer</b> = em aberto no ERP por vencimento. ${m.transitoTotal > 0 ? `<b style="color:#7c3aed">Em trânsito</b> = pedidos ENVIADO/FATURADO ainda não lançados no ERP (caixa já comprometido) — mesmo número da tela de pedidos${transitoEmBR ? `, sincronizado em ${transitoEmBR}` : ""}. ` : ""}<b>Total</b> = já pago + a vencer${m.transitoTotal > 0 ? " + em trânsito (comprometido)" : ""}.</div>
     </section>
   </div>
 
