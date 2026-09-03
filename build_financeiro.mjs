@@ -138,13 +138,13 @@ function projMesLoja(key, mes1a12) {
 }
 const diasNoMes = (y, m) => new Date(y, m, 0).getDate(); // m 1-12
 function diasDaSemana(k) { const [y, m, d] = k.split("-").map(Number); const out = []; let dt = new Date(y, m - 1, d); for (let i = 0; i < 7; i++) { out.push(dt); dt = new Date(dt.getFullYear(), dt.getMonth(), dt.getDate() + 1); } return out; }
-// entrada BRUTA projetada da semana p/ uma loja: mês corrente = ritmo real; meses à frente = projeção sazonal
-function entradaBrutaSemanaLoja(key, k, ritmoDia) {
+// entrada BRUTA projetada da semana p/ uma loja: mês corrente = rate estável; meses à frente = sazonal
+function entradaBrutaSemanaLoja(key, k, ritmoCurDia) {
   let g = 0;
   for (const dt of diasDaSemana(k)) {
     const ym = `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}`;
     if (ym < MES_ATUAL) continue;                    // dia já passado
-    if (ym === MES_ATUAL || !TEM_SAZONAL) { g += ritmoDia; continue; } // mês em curso (ou sem base 2025): ritmo real
+    if (ym === MES_ATUAL || !TEM_SAZONAL) { g += ritmoCurDia; continue; } // mês em curso: rate estável (realizado+sazonal)
     const mesN = dt.getMonth() + 1;
     g += projMesLoja(key, mesN) / diasNoMes(dt.getFullYear(), mesN);   // futuro: run-rate sazonal
   }
@@ -176,7 +176,14 @@ function modeloLoja(key, idx) {
   const fatAtual = serie26[iAtual] || 0, fatAnt = serie26[iAtual - 1] || 0;
   const fat25Atual = serie25[iAtual] || 0;
   const diaAtual = now.getDate();
-  const ritmoDia = diaAtual ? fatAtual / diaAtual : 0; // ritmo de vendas do mês em curso
+  const ritmoDia = diaAtual ? fatAtual / diaAtual : 0; // ritmo de vendas do mês em curso (bruto, ruidoso no começo do mês)
+  // projeção ESTÁVEL do mês corrente = realizado até hoje + sazonal p/ os dias que faltam.
+  // Converge pro real conforme o mês anda; não sofre com o ruído dos primeiros dias.
+  const curMesN = now.getMonth() + 1, curDias = diasNoMes(now.getFullYear(), curMesN);
+  const projCurMes = TEM_SAZONAL
+    ? fatAtual + projMesLoja(key, curMesN) * Math.max(0, curDias - diaAtual) / curDias
+    : ritmoDia * curDias;
+  const ritmoCurDia = curDias ? projCurMes / curDias : ritmoDia; // rate/dia estável p/ o mês corrente
   // DRE buckets (janela)
   const buckets = {}; for (const b of BUCKETS) buckets[b.key] = 0;
   let totalDespesa = 0;
@@ -200,7 +207,7 @@ function modeloLoja(key, idx) {
   const fluxo = SEMANAS.map(k => {
     const saiErp = pagar.porSemana[k] || 0;
     const caixa = caixaSemanaLoja(key, k);
-    const entraBruta = entradaBrutaSemanaLoja(key, k, ritmoDia);
+    const entraBruta = entradaBrutaSemanaLoja(key, k, ritmoCurDia);
     const entra = liquido(entraBruta);
     return { k, sai: saiErp + caixa, saiErp, caixa, entraBruta, entra };
   });
@@ -215,7 +222,7 @@ function modeloLoja(key, idx) {
   const mensal = MESES_FLUXO.map(ym => {
     const y = +ym.slice(0, 4), mesN = +ym.slice(5);
     const emCurso = ym === MES_ATUAL;
-    const entraBruta = (emCurso || !TEM_SAZONAL) ? ritmoDia * diasNoMes(y, mesN) : projMesLoja(key, mesN);
+    const entraBruta = emCurso ? projCurMes : (TEM_SAZONAL ? projMesLoja(key, mesN) : ritmoDia * diasNoMes(y, mesN));
     const entra = liquido(entraBruta);
     const fixoLanc = custoFixoPorMes[ym] || 0;
     const fixoEsp = Math.max(fixoLanc, baseFixo);          // reserva o piso p/ meses incompletos
@@ -226,7 +233,7 @@ function modeloLoja(key, idx) {
     return { ym, emCurso, entra, fixoEsp, fixoLanc, outros, caixa: caixaMes, transito, compromisso, cabe: entra - compromisso };
   });
   return {
-    mensal, baseFixo, transitoPorMes, transitoTotal,
+    mensal, baseFixo, transitoPorMes, transitoTotal, projCurMes, ritmoCurDia,
     key, meses, serie26, serie25, iAtual, fatAtual, fatAnt, fat25Atual, ritmoDia,
     buckets, totalDespesa,
     pagarAberto: pagar.abertoValor, pagarAtrasado: pagar.atrasadoValor, pagarAtrasadoQtd: pagar.atrasadoQtd,
@@ -248,10 +255,10 @@ function modeloGrupo() {
     receberAberto = 0, receberAtrasado = 0, receberAtrasadoQtd = 0, pagarMes = 0, pagarMesAnt = 0, totalDespesa = 0,
     pagoMesAtual = 0, pagoMesAnt = 0;
   const serie26 = fat26.meses.map(() => 0), serie25 = fat26.meses.map(() => 0);
-  let ritmoDia = 0;
+  let ritmoDia = 0, projCurMes = 0, ritmoCurDia = 0;
   for (const l of LOJAS) {
     const m = M[l.key];
-    fatAtual += m.fatAtual; fatAnt += m.fatAnt; fat25Atual += m.fat25Atual; ritmoDia += m.ritmoDia;
+    fatAtual += m.fatAtual; fatAnt += m.fatAnt; fat25Atual += m.fat25Atual; ritmoDia += m.ritmoDia; projCurMes += m.projCurMes; ritmoCurDia += m.ritmoCurDia;
     pagarAberto += m.pagarAberto; pagarAtrasado += m.pagarAtrasado; pagarAtrasadoQtd += m.pagarAtrasadoQtd;
     receberAberto += m.receberAberto; receberAtrasado += m.receberAtrasado; receberAtrasadoQtd += m.receberAtrasadoQtd;
     pagarMes += m.pagarMes; pagarMesAnt += m.pagarMesAnt; totalDespesa += m.totalDespesa;
@@ -276,7 +283,7 @@ function modeloGrupo() {
   const topForn = mergeTop("topFornecedores"), topCli = mergeTop("topClientes");
   return {
     mensal: g.mensal, transitoPorMes: g.transitoPorMes, transitoTotal: Object.values(g.transitoPorMes).reduce((s, v) => s + v, 0),
-    key: "GRUPO", meses: fat26.meses, serie26, serie25, iAtual: fat26.meses.length - 1, ritmoDia,
+    key: "GRUPO", meses: fat26.meses, serie26, serie25, iAtual: fat26.meses.length - 1, ritmoDia, projCurMes, ritmoCurDia,
     fatAtual, fatAnt, fat25Atual, buckets: g.buckets, totalDespesa,
     pagarAberto, pagarAtrasado, pagarAtrasadoQtd, receberAberto, receberAtrasado, receberAtrasadoQtd,
     pagarMes, pagarMesAnt, resAtual: fatAtual - pagarMes, resAnt: fatAnt - pagarMesAnt,
@@ -386,7 +393,7 @@ function listaTop(items, tipo) {
 
 function kpiCards(m) {
   const yo = m.fat25Atual ? pct(m.fatAtual - m.fat25Atual, m.fat25Atual) : 0;
-  const projMes = m.ritmoDia * 30;
+  const projMes = m.projCurMes || m.ritmoDia * 30;   // projeção estável (realizado + sazonal) do mês corrente
   return `<div class="kpis">
     <div class="kpi">
       <div class="kpi-t">Faturamento ${mesNome(MES_ATUAL)} <span class="tag">parcial</span></div>
