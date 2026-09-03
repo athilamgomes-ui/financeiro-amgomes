@@ -209,6 +209,9 @@ function modeloLoja(key, idx) {
   // Meses distantes têm só o recorrente lançado (falta folha etc.); reservar o piso evita superestimar a sobra.
   const baseFixo = Math.max(0, ...Object.values(custoFixoPorMes));
   const caixaMes = (CAIXA_PARCELA && CAIXA_PARCELA.lojas.includes(key)) ? CAIXA_PARCELA.valor / CAIXA_PARCELA.lojas.length : 0;
+  // em trânsito (pedidos não lançados no ERP) desta loja, por mês
+  const transitoPorMes = (emTransito && emTransito.porLoja[key]) || {};
+  const transitoTotal = Object.values(transitoPorMes).reduce((s, v) => s + v, 0);
   const mensal = MESES_FLUXO.map(ym => {
     const y = +ym.slice(0, 4), mesN = +ym.slice(5);
     const emCurso = ym === MES_ATUAL;
@@ -218,12 +221,10 @@ function modeloLoja(key, idx) {
     const fixoEsp = Math.max(fixoLanc, baseFixo);          // reserva o piso p/ meses incompletos
     const totalPagar = (pagar.porMes[ym] || {}).total || 0;
     const outros = Math.max(0, totalPagar - fixoLanc);     // variável já lançado (mercadoria, impostos…)
-    const compromisso = fixoEsp + outros + caixaMes;
-    return { ym, emCurso, entra, fixoEsp, fixoLanc, outros, caixa: caixaMes, compromisso, cabe: entra - compromisso };
+    const transito = transitoPorMes[ym] || 0;              // pedidos em trânsito (comprometido, fora do ERP)
+    const compromisso = fixoEsp + outros + caixaMes + transito;
+    return { ym, emCurso, entra, fixoEsp, fixoLanc, outros, caixa: caixaMes, transito, compromisso, cabe: entra - compromisso };
   });
-  // em trânsito (pedidos não lançados no ERP) desta loja, por mês
-  const transitoPorMes = (emTransito && emTransito.porLoja[key]) || {};
-  const transitoTotal = Object.values(transitoPorMes).reduce((s, v) => s + v, 0);
   return {
     mensal, baseFixo, transitoPorMes, transitoTotal,
     key, meses, serie26, serie25, iAtual, fatAtual, fatAnt, fat25Atual, ritmoDia,
@@ -241,7 +242,7 @@ const M = {}; LOJAS.forEach((l, i) => { M[l.key] = modeloLoja(l.key, i); });
 
 // grupo consolidado
 function modeloGrupo() {
-  const g = { buckets: {}, fluxo: SEMANAS.map(k => ({ k, sai: 0, saiErp: 0, caixa: 0, entra: 0, entraBruta: 0 })), mensal: MESES_FLUXO.map(ym => ({ ym, emCurso: ym === MES_ATUAL, entra: 0, fixoEsp: 0, fixoLanc: 0, outros: 0, caixa: 0, compromisso: 0, cabe: 0 })), pagarPorMes: {}, receberPorMes: {}, pagoPorMes: {}, custoFixoPorMes: {}, transitoPorMes: {} };
+  const g = { buckets: {}, fluxo: SEMANAS.map(k => ({ k, sai: 0, saiErp: 0, caixa: 0, entra: 0, entraBruta: 0 })), mensal: MESES_FLUXO.map(ym => ({ ym, emCurso: ym === MES_ATUAL, entra: 0, fixoEsp: 0, fixoLanc: 0, outros: 0, caixa: 0, transito: 0, compromisso: 0, cabe: 0 })), pagarPorMes: {}, receberPorMes: {}, pagoPorMes: {}, custoFixoPorMes: {}, transitoPorMes: {} };
   for (const b of BUCKETS) g.buckets[b.key] = 0;
   let fatAtual = 0, fatAnt = 0, fat25Atual = 0, pagarAberto = 0, pagarAtrasado = 0, pagarAtrasadoQtd = 0,
     receberAberto = 0, receberAtrasado = 0, receberAtrasadoQtd = 0, pagarMes = 0, pagarMesAnt = 0, totalDespesa = 0,
@@ -262,7 +263,7 @@ function modeloGrupo() {
     m.serie26.forEach((v, i) => serie26[i] += v);
     m.serie25.forEach((v, i) => serie25[i] += v);
     m.fluxo.forEach((f, i) => { g.fluxo[i].sai += f.sai; g.fluxo[i].saiErp += f.saiErp; g.fluxo[i].caixa += f.caixa; g.fluxo[i].entra += f.entra; g.fluxo[i].entraBruta += f.entraBruta; });
-    m.mensal.forEach((mm, i) => { g.mensal[i].entra += mm.entra; g.mensal[i].fixoEsp += mm.fixoEsp; g.mensal[i].fixoLanc += mm.fixoLanc; g.mensal[i].outros += mm.outros; g.mensal[i].caixa += mm.caixa; g.mensal[i].compromisso += mm.compromisso; g.mensal[i].cabe += mm.cabe; });
+    m.mensal.forEach((mm, i) => { g.mensal[i].entra += mm.entra; g.mensal[i].fixoEsp += mm.fixoEsp; g.mensal[i].fixoLanc += mm.fixoLanc; g.mensal[i].outros += mm.outros; g.mensal[i].caixa += mm.caixa; g.mensal[i].transito += (mm.transito || 0); g.mensal[i].compromisso += mm.compromisso; g.mensal[i].cabe += mm.cabe; });
     for (const [k, v] of Object.entries(m.pagarPorMes)) { g.pagarPorMes[k] = g.pagarPorMes[k] || { total: 0 }; g.pagarPorMes[k].total += v.total; }
     for (const [k, v] of Object.entries(m.receberPorMes)) { g.receberPorMes[k] = g.receberPorMes[k] || { total: 0 }; g.receberPorMes[k].total += v.total; }
   }
@@ -463,7 +464,7 @@ function tabContent(m, isGrupo) {
       <div id="fx-mes-${m.key}" style="display:none">
         <div class="legend legend-row"><i class="dot g"></i>Entra líquida <i class="dot r"></i>Compromisso (custo fixo reservado) <i class="dash"></i>caixa acumulado · <b>nº acima da barra = sobra de caixa</b></div>
         ${svgFluxoMensal(m.mensal, m.key)}
-        <div class="note"><b>Visão mensal</b> — a diferença barra verde − vermelha é a <b>sobra de caixa</b> do mês (repetida acima de cada barra), já reservando o <b>custo fixo cheio</b> dos meses à frente (aluguel, folha, energia). <b>Compromisso</b> = custo fixo + contas já lançadas + parcela da Caixa. Compare com o <b>Faturamento mensal</b> ao lado: aquele é o realizado; este é a estimativa futura.</div>
+        <div class="note"><b>Visão mensal</b> — a diferença barra verde − vermelha é a <b>sobra de caixa</b> do mês (repetida acima de cada barra), já reservando o <b>custo fixo cheio</b> dos meses à frente (aluguel, folha, energia). <b>Compromisso</b> = custo fixo + contas já lançadas no ERP + parcela da Caixa${m.transitoTotal > 0 ? ` + <b style="color:#7c3aed">pedidos em trânsito</b> (comprometido fora do ERP)` : ""}. Compare com o <b>Faturamento mensal</b> ao lado: aquele é o realizado; este é a estimativa futura.</div>
       </div>
     </section>
 
