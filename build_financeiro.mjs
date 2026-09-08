@@ -58,6 +58,15 @@ async function fetchEmTransito() {
 }
 const emTransito = await fetchEmTransito();
 const transitoEmBR = (emTransito && emTransito.atualizadoEm) ? new Date(emTransito.atualizadoEm).toLocaleString("pt-BR", { day: "2-digit", month: "2-digit", year: "2-digit", hour: "2-digit", minute: "2-digit" }) : null;
+// Guarda anti-podridão: o em-trânsito vem de pedidos_comprometido, regravado pelo planejamento.html.
+// Se ficar velho (escritor removido / refresh falhou), o Financeiro passa a divergir da tela de pedidos
+// EM SILÊNCIO (foi o bug de 03→08/09/2026). Aqui gritamos no log do build se passar de 18h.
+if (emTransito && emTransito.atualizadoEm) {
+  const idadeH = (Date.now() - new Date(emTransito.atualizadoEm).getTime()) / 3600000;
+  if (idadeH > 18) console.error(`[build] ⚠️ ATENÇÃO: em trânsito (pedidos_comprometido) tem ${idadeH.toFixed(0)}h — pode divergir da tela de pedidos. Verifique refresh_comprometido.mjs / persistirComprometido no planejamento.html.`);
+} else {
+  console.error("[build] ⚠️ ATENÇÃO: em trânsito indisponível (pedidos_comprometido não lido) — Financeiro vai subestimar o comprometido.");
+}
 
 // ── util ──
 const pad = n => String(n).padStart(2, "0");

@@ -43,6 +43,12 @@ $NODE coleta_amgomes_mensal.mjs "$ANO_ANT" "$MES" "$DIA" > /tmp/fin_fat25.json 2
 if [ $RC26 -eq 0 ] && [ -s /tmp/fin_fat26.json ]; then cp /tmp/fin_fat26.json "$REPO/fat_$AAAA.json"; else log "AVISO: faturamento $AAAA falhou (rc=$RC26) — mantém anterior"; fi
 if [ $RC25 -eq 0 ] && [ -s /tmp/fin_fat25.json ]; then cp /tmp/fin_fat25.json "$REPO/fat_$ANO_ANT.json"; else log "AVISO: faturamento $ANO_ANT falhou (rc=$RC25) — mantém anterior"; fi
 
+# ── 2.5) Refresh do "em trânsito" (pedidos_comprometido) ANTES do build ──
+# Abre o planejamento.html headless → persistirComprometido() regrava o snapshot fresco.
+# Não-bloqueante: se falhar, o build usa o snapshot que existir e a guarda de idade avisa.
+log "atualizando em trânsito (pedidos_comprometido)..."
+if $NODE refresh_comprometido.mjs 2>/tmp/fin_transito_err.txt; then log "em trânsito OK"; else log "AVISO: refresh do em trânsito falhou — build segue com o snapshot atual"; tail -3 /tmp/fin_transito_err.txt; fi
+
 # ── 3) Build ──
 cd "$REPO" || exit 20
 cp -f "$HTML" /tmp/fin_html_bak.html 2>/dev/null
