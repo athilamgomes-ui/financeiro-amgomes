@@ -45,7 +45,7 @@ else log "ERRO: coleta pagar/receber falhou (rc=$?) — PRESERVANDO anterior"; t
 coletar_fat(){ # $1=ano  $2=arquivo-base(fechados)  $3=mes_inicial
   local ano="$1" base="$2" mi="$3" fresh="/tmp/fin_fat_${1}_fresh.json" tmp="/tmp/fin_fat_${1}.json"
   if $NODE coleta_amgomes_mensal.mjs "$ano" "$MES" "$DIA" "$mi" > "$fresh" 2>"/tmp/fin_fat_${1}_err.txt" && [ -s "$fresh" ]; then
-    if $NODE merge_fat_mensal.mjs --ano "$ano" --mesfinal "$MES" --base "$base" --fresh "$fresh" --out "$tmp"; then
+    if $NODE "$REPO/merge_fat_mensal.mjs" --ano "$ano" --mesfinal "$MES" --base "$base" --fresh "$fresh" --out "$tmp"; then
       cp "$tmp" "$REPO/fat_$ano.json"; log "faturamento $ano OK (incremental: mês $mi..$MES do ERP + fechados do arquivo)"; return 0
     fi
     log "merge $ano incompleto → coleta COMPLETA (fallback)"
