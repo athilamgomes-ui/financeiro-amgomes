@@ -36,12 +36,32 @@ if $NODE coleta_financeiro.mjs > /tmp/fin_raw.json 2>/tmp/fin_raw_err.txt; then
   else log "ERRO: saída pagar/receber vazia/inválida — PRESERVANDO anterior"; tail -3 /tmp/fin_raw_err.txt; exit 10; fi
 else log "ERRO: coleta pagar/receber falhou (rc=$?) — PRESERVANDO anterior"; tail -5 /tmp/fin_raw_err.txt; exit 10; fi
 
-# ── 2) Faturamento mensal (atual + anterior, janela simétrica) ──
-log "coletando faturamento $AAAA e $ANO_ANT (até $DIA/$MES)..."
-$NODE coleta_amgomes_mensal.mjs "$AAAA"    "$MES" "$DIA" > /tmp/fin_fat26.json 2>/tmp/fin_fat26_err.txt; RC26=$?
-$NODE coleta_amgomes_mensal.mjs "$ANO_ANT" "$MES" "$DIA" > /tmp/fin_fat25.json 2>/tmp/fin_fat25_err.txt; RC25=$?
-if [ $RC26 -eq 0 ] && [ -s /tmp/fin_fat26.json ]; then cp /tmp/fin_fat26.json "$REPO/fat_$AAAA.json"; else log "AVISO: faturamento $AAAA falhou (rc=$RC26) — mantém anterior"; fi
-if [ $RC25 -eq 0 ] && [ -s /tmp/fin_fat25.json ]; then cp /tmp/fin_fat25.json "$REPO/fat_$ANO_ANT.json"; else log "AVISO: faturamento $ANO_ANT falhou (rc=$RC25) — mantém anterior"; fi
+# ── 2) Faturamento mensal — INCREMENTAL (só o mês corrente parcial; fechados vêm do arquivo) ──
+# Antes recoletava jan→mês-atual dos DOIS anos TODA noite (~90 idas ao ERP: 1 relatório + 4 rankings
+# de cliente 8 por mês). Como 2025 é imutável e jan..mês-anterior de 2026 são meses FECHADOS, isso era
+# desperdício. Agora coleta só o mês em curso (parcial) e faz MERGE com os fechados já salvos
+# (fat_$ANO.json p/ o ano atual; fat_${ANO_ANT}_full.json p/ o anterior). Se a base estiver incompleta,
+# cai no FALLBACK de coleta completa (mesma robustez de antes). YoY continua simétrico (mesmo DIA nos 2 anos).
+coletar_fat(){ # $1=ano  $2=arquivo-base(fechados)  $3=mes_inicial
+  local ano="$1" base="$2" mi="$3" fresh="/tmp/fin_fat_${1}_fresh.json" tmp="/tmp/fin_fat_${1}.json"
+  if $NODE coleta_amgomes_mensal.mjs "$ano" "$MES" "$DIA" "$mi" > "$fresh" 2>"/tmp/fin_fat_${1}_err.txt" && [ -s "$fresh" ]; then
+    if $NODE merge_fat_mensal.mjs --ano "$ano" --mesfinal "$MES" --base "$base" --fresh "$fresh" --out "$tmp"; then
+      cp "$tmp" "$REPO/fat_$ano.json"; log "faturamento $ano OK (incremental: mês $mi..$MES do ERP + fechados do arquivo)"; return 0
+    fi
+    log "merge $ano incompleto → coleta COMPLETA (fallback)"
+  else
+    log "AVISO: coleta parcial $ano falhou — tentando coleta completa"; tail -2 "/tmp/fin_fat_${1}_err.txt" 2>/dev/null
+  fi
+  if $NODE coleta_amgomes_mensal.mjs "$ano" "$MES" "$DIA" > "$tmp" 2>>"/tmp/fin_fat_${1}_err.txt" && [ -s "$tmp" ]; then
+    cp "$tmp" "$REPO/fat_$ano.json"; log "faturamento $ano OK (coleta completa)"; return 0
+  fi
+  log "AVISO: faturamento $ano falhou — mantém anterior"; return 1
+}
+# nos 3 primeiros dias do mês, recoleta também o mês recém-fechado do ANO ATUAL p/ finalizá-lo no arquivo
+MES_INI26=$MES; if [ "$DIA" -le 3 ] && [ "$MES" -gt 1 ]; then MES_INI26=$((MES-1)); fi
+log "coletando faturamento incremental (mês corrente, dia $DIA)..."
+coletar_fat "$AAAA"    "$REPO/fat_$AAAA.json"            "$MES_INI26"
+coletar_fat "$ANO_ANT" "$REPO/fat_${ANO_ANT}_full.json" "$MES"
 
 # ── 2.5) Refresh do "em trânsito" (pedidos_comprometido) ANTES do build ──
 # Abre o planejamento.html headless → persistirComprometido() regrava o snapshot fresco.
