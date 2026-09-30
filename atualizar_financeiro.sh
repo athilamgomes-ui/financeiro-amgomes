@@ -36,13 +36,11 @@ if $NODE coleta_financeiro.mjs > /tmp/fin_raw.json 2>/tmp/fin_raw_err.txt; then
   else log "ERRO: saída pagar/receber vazia/inválida — PRESERVANDO anterior"; tail -3 /tmp/fin_raw_err.txt; exit 10; fi
 else log "ERRO: coleta pagar/receber falhou (rc=$?) — PRESERVANDO anterior"; tail -5 /tmp/fin_raw_err.txt; exit 10; fi
 
-# ── 2) Faturamento mensal — INCREMENTAL (só o mês corrente parcial; fechados vêm do arquivo) ──
-# Antes recoletava jan→mês-atual dos DOIS anos TODA noite (~90 idas ao ERP: 1 relatório + 4 rankings
-# de cliente 8 por mês). Como 2025 é imutável e jan..mês-anterior de 2026 são meses FECHADOS, isso era
-# desperdício. Agora coleta só o mês em curso (parcial) e faz MERGE com os fechados já salvos
-# (fat_$ANO.json p/ o ano atual; fat_${ANO_ANT}_full.json p/ o anterior). Se a base estiver incompleta,
-# cai no FALLBACK de coleta completa (mesma robustez de antes). YoY continua simétrico (mesmo DIA nos 2 anos).
-coletar_fat(){ # $1=ano  $2=arquivo-base(fechados)  $3=mes_inicial
+# ── 2) Faturamento mensal — FONTE ÚNICA = Vendas (fallback: coleta incremental do ERP) ──
+# Desde 30/09/2026 o faturamento vem do `fatMensal` do dashboard de VENDAS (ver invocação abaixo).
+# A função coletar_fat() abaixo é só o FALLBACK: coleta incremental (só o mês corrente + merge dos
+# fechados de fat_$ANO.json / fat_${ANO_ANT}_full.json), usada se a extração do Vendas falhar.
+coletar_fat(){ # $1=ano  $2=arquivo-base(fechados)  $3=mes_inicial [FALLBACK]
   local ano="$1" base="$2" mi="$3" fresh="/tmp/fin_fat_${1}_fresh.json" tmp="/tmp/fin_fat_${1}.json"
   if $NODE coleta_amgomes_mensal.mjs "$ano" "$MES" "$DIA" "$mi" > "$fresh" 2>"/tmp/fin_fat_${1}_err.txt" && [ -s "$fresh" ]; then
     if $NODE "$REPO/merge_fat_mensal.mjs" --ano "$ano" --mesfinal "$MES" --base "$base" --fresh "$fresh" --out "$tmp"; then
@@ -57,11 +55,19 @@ coletar_fat(){ # $1=ano  $2=arquivo-base(fechados)  $3=mes_inicial
   fi
   log "AVISO: faturamento $ano falhou — mantém anterior"; return 1
 }
-# nos 3 primeiros dias do mês, recoleta também o mês recém-fechado do ANO ATUAL p/ finalizá-lo no arquivo
-MES_INI26=$MES; if [ "$DIA" -le 3 ] && [ "$MES" -gt 1 ]; then MES_INI26=$((MES-1)); fi
-log "coletando faturamento incremental (mês corrente, dia $DIA)..."
-coletar_fat "$AAAA"    "$REPO/fat_$AAAA.json"            "$MES_INI26"
-coletar_fat "$ANO_ANT" "$REPO/fat_${ANO_ANT}_full.json" "$MES"
+# FONTE ÚNICA (30/09/2026): o faturamento vem do `fatMensal` já publicado pelo dashboard de VENDAS
+# (mesmo número, Venda Líquida líquida do cliente 8) → os dois painéis NUNCA divergem no mês corrente,
+# que era a única inconsistência que sobrava (timing de dois coletores). Também tira a coleta pesada de
+# faturamento do financeiro. Se a extração falhar (Vendas não rodou hoje / formato do literal mudou),
+# cai no FALLBACK incremental de coleta do ERP (coletar_fat, acima) — mesma robustez de antes.
+if $NODE "$REPO/extrai_fat_vendas.mjs"; then
+  log "faturamento OK (fonte ÚNICA = Vendas/fatMensal — sem tocar o ERP)"
+else
+  log "AVISO: extração do Vendas falhou → fallback: coleta incremental do ERP"
+  MES_INI26=$MES; if [ "$DIA" -le 3 ] && [ "$MES" -gt 1 ]; then MES_INI26=$((MES-1)); fi
+  coletar_fat "$AAAA"    "$REPO/fat_$AAAA.json"            "$MES_INI26"
+  coletar_fat "$ANO_ANT" "$REPO/fat_${ANO_ANT}_full.json" "$MES"
+fi
 
 # ── 2.5) Refresh do "em trânsito" (pedidos_comprometido) ANTES do build ──
 # Abre o planejamento.html headless → persistirComprometido() regrava o snapshot fresco.
