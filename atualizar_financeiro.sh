@@ -69,6 +69,24 @@ else
   coletar_fat "$ANO_ANT" "$REPO/fat_${ANO_ANT}_full.json" "$MES"
 fi
 
+# ── 2.3) Despesas do DRE (regime CAIXA) — dobra as faturas PAGAS (já coletadas no passo 1,
+# financeiro_raw.json: pago.catPorMes do mês corrente+anterior) no cache dre_despesas_$AAAA.json.
+# Sem ERP. Meses históricos vêm do backfill (backfill_despesas_dre.mjs, roda uma vez). Não-bloqueante.
+log "atualizando despesas do DRE (caixa)..."
+if $NODE "$REPO/atualiza_despesas_dre.mjs" 2>/tmp/fin_desp_err.txt; then log "despesas DRE OK"; else log "AVISO: atualiza_despesas_dre falhou — DRE usa o cache anterior"; tail -3 /tmp/fin_desp_err.txt; fi
+
+# ── 2.6) Margem/CMV do DRE (fonte do CMV) — coleta SÓ o mês corrente (PESADO: Produtos Vendidos
+# por marca, custo época, streaming ~2min) e faz merge com os meses fechados de margem_$AAAA.json.
+# Limpa custo médio corrompido (marca com custo>faturamento → capada). Se falhar, mantém o anterior
+# (o build já tolera: sem margem, a seção DRE some e o resto do painel segue). Incremental.
+log "coletando margem/CMV do mês corrente (ERP, pesado ~2min)..."
+MARGEM_FRESH="/tmp/fin_margem_fresh.json"
+if $NODE coleta_margem_mensal.mjs "$AAAA" "$MES" "$MES" > "$MARGEM_FRESH" 2>/tmp/fin_margem_err.txt && [ -s "$MARGEM_FRESH" ]; then
+  if $NODE "$REPO/merge_margem_mensal.mjs" --ano "$AAAA" --mesfinal "$MES" --base "$REPO/margem_$AAAA.json" --fresh "$MARGEM_FRESH" --out "$REPO/margem_$AAAA.json"; then
+    log "margem OK (mês $MES do ERP + fechados do arquivo)"
+  else log "AVISO: merge de margem incompleto — mantém margem_$AAAA.json anterior"; fi
+else log "AVISO: coleta de margem falhou — DRE usa a margem anterior"; tail -3 /tmp/fin_margem_err.txt; fi
+
 # ── 2.5) Refresh do "em trânsito" (pedidos_comprometido) ANTES do build ──
 # Abre o planejamento.html headless → persistirComprometido() regrava o snapshot fresco.
 # Não-bloqueante: se falhar, o build usa o snapshot que existir e a guarda de idade avisa.

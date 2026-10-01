@@ -31,9 +31,14 @@ function cifrar(plain, senha) {
   return { salt: salt.toString("base64"), iv: iv.toString("base64"), data: Buffer.concat([ct, tag]).toString("base64"), iters: ITERS };
 }
 const rd = f => JSON.parse(fs.readFileSync(path.join(DIR, f), "utf8"));
+const rdOpt = f => { try { return rd(f); } catch { return null; } };
 const fin = rd("financeiro_raw.json");
 const fat26 = rd("fat_2026.json");
 const fat25 = rd("fat_2025.json");
+// ── DRE (01/10/2026): margem/CMV real do ERP (custo época, limpo de custo corrompido) + despesas
+// pagas por caixa. Ambos opcionais — sem eles, a seção DRE some e o resto do painel segue igual. ──
+const margemData = rdOpt("margem_2026.json");     // {ano,meses,L1:[{fat,custo,custoRaw,margem,margemRaw,anomalias}],...}
+const despesasData = rdOpt("dre_despesas_2026.json"); // {ano,L1:{"2026-09":{total,cats:[{nome,valor}]}},...}
 const r2c = n => Math.round((n || 0) * 100) / 100;
 
 // ── EM TRÂNSITO: pedidos ENVIADO/FATURADO ainda NÃO lançados no ERP (caixa já comprometido) ──
@@ -241,7 +246,37 @@ function modeloLoja(key, idx) {
     const compromisso = fixoEsp + outros + caixaMes + transito;
     return { ym, emCurso, entra, fixoEsp, fixoLanc, outros, caixa: caixaMes, transito, compromisso, cabe: entra - compromisso };
   });
+  // ── DRE gerencial por mês (regime: receita+CMV por competência da venda; despesas por CAIXA) ──
+  // Receita = faturamento (Venda Líquida, fonte única). CMV = receita × (1 − margem/100), com a
+  // margem REAL do ERP (custo época, já limpa de custo médio corrompido). Despesas = faturas PAGAS
+  // no mês por bucket, EXCETO mercadoria (o CMV já é o custo da mercadoria vendida → não duplicar).
+  // margem indexada por NÚMERO do mês (margem_2026.json pode ter meses != fat_2026.json)
+  const margemByMes = {};
+  if (margemData && Array.isArray(margemData.meses) && margemData[key]) margemData.meses.forEach((mn, idx) => { margemByMes[mn] = margemData[key][idx]; });
+  const despCache = (despesasData && despesasData[key]) || {};
+  const caixaMesLoja = (CAIXA_PARCELA && CAIXA_PARCELA.lojas.includes(key)) ? CAIXA_PARCELA.valor / CAIXA_PARCELA.lojas.length : 0;
+  const dre = meses.map((mesN, i) => {
+    const ym = `${fat26.ano}-${pad(mesN)}`;
+    const receita = serie26[i] || 0;
+    const mc = margemByMes[mesN] || null;
+    const margemPct = (mc && mc.fat > 0) ? mc.margem : null;       // ajustada (limpa de corrupção)
+    const margemRawPct = (mc && mc.fat > 0) ? mc.margemRaw : null; // fiel ao ERP (referência)
+    const anomalias = (mc && mc.anomalias) || [];
+    const cmv = margemPct != null ? r0(receita * (1 - margemPct / 100)) : null;
+    const lucroBruto = cmv != null ? receita - cmv : null;
+    const dc = despCache[ym];
+    let despBuckets = null, opex = null;
+    if (dc && Array.isArray(dc.cats)) {
+      despBuckets = {}; for (const b of BUCKETS) despBuckets[b.key] = 0;
+      for (const c of dc.cats) despBuckets[bucketOf(c.nome)] += c.valor;
+      if (caixaMesLoja) despBuckets.financiamento += caixaMesLoja; // parcela Caixa (fora do ERP), caixa do mês
+      opex = 0; for (const b of BUCKETS) if (b.key !== "mercadoria") opex += despBuckets[b.key];
+    }
+    const resultado = (lucroBruto != null && opex != null) ? lucroBruto - opex : null;
+    return { ym, mesN, receita, margemPct, margemRawPct, cmv, lucroBruto, despBuckets, opex, resultado, anomalias, temDesp: !!dc };
+  });
   return {
+    dre,
     mensal, baseFixo, transitoPorMes, transitoTotal, projCurMes, ritmoCurDia,
     key, meses, serie26, serie25, iAtual, fatAtual, fatAnt, fat25Atual, ritmoDia,
     buckets, totalDespesa,
@@ -260,6 +295,7 @@ const M = {}; LOJAS.forEach((l, i) => { M[l.key] = modeloLoja(l.key, i); });
 function modeloGrupo() {
   const g = { buckets: {}, fluxo: SEMANAS.map(k => ({ k, sai: 0, saiErp: 0, caixa: 0, entra: 0, entraBruta: 0 })), mensal: MESES_FLUXO.map(ym => ({ ym, emCurso: ym === MES_ATUAL, entra: 0, fixoEsp: 0, fixoLanc: 0, outros: 0, caixa: 0, transito: 0, compromisso: 0, cabe: 0 })), pagarPorMes: {}, receberPorMes: {}, pagoPorMes: {}, custoFixoPorMes: {}, transitoPorMes: {} };
   for (const b of BUCKETS) g.buckets[b.key] = 0;
+  g.dre = fat26.meses.map(mesN => ({ ym: `${fat26.ano}-${pad(mesN)}`, mesN, receita: 0, cmv: 0, lucroBruto: 0, opex: 0, despBuckets: Object.fromEntries(BUCKETS.map(b => [b.key, 0])), nCmv: 0, nDesp: 0, anomalias: [] }));
   let fatAtual = 0, fatAnt = 0, fat25Atual = 0, pagarAberto = 0, pagarAtrasado = 0, pagarAtrasadoQtd = 0,
     receberAberto = 0, receberAtrasado = 0, receberAtrasadoQtd = 0, pagarMes = 0, pagarMesAnt = 0, totalDespesa = 0,
     pagoMesAtual = 0, pagoMesAnt = 0;
@@ -280,6 +316,7 @@ function modeloGrupo() {
     m.serie25.forEach((v, i) => serie25[i] += v);
     m.fluxo.forEach((f, i) => { g.fluxo[i].sai += f.sai; g.fluxo[i].saiErp += f.saiErp; g.fluxo[i].caixa += f.caixa; g.fluxo[i].entra += f.entra; g.fluxo[i].entraBruta += f.entraBruta; });
     m.mensal.forEach((mm, i) => { g.mensal[i].entra += mm.entra; g.mensal[i].fixoEsp += mm.fixoEsp; g.mensal[i].fixoLanc += mm.fixoLanc; g.mensal[i].outros += mm.outros; g.mensal[i].caixa += mm.caixa; g.mensal[i].transito += (mm.transito || 0); g.mensal[i].compromisso += mm.compromisso; g.mensal[i].cabe += mm.cabe; });
+    m.dre.forEach((d, i) => { const gd = g.dre[i]; gd.receita += d.receita; if (d.cmv != null) { gd.cmv += d.cmv; gd.lucroBruto += d.lucroBruto; gd.nCmv++; } if (d.opex != null) { gd.opex += d.opex; for (const b of BUCKETS) gd.despBuckets[b.key] += d.despBuckets[b.key]; gd.nDesp++; } for (const a of d.anomalias) gd.anomalias.push({ ...a, loja: l.key }); });
     for (const [k, v] of Object.entries(m.pagarPorMes)) { g.pagarPorMes[k] = g.pagarPorMes[k] || { total: 0 }; g.pagarPorMes[k].total += v.total; }
     for (const [k, v] of Object.entries(m.receberPorMes)) { g.receberPorMes[k] = g.receberPorMes[k] || { total: 0 }; g.receberPorMes[k].total += v.total; }
   }
@@ -290,7 +327,20 @@ function modeloGrupo() {
     return Object.entries(acc).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([nome, valor]) => ({ nome, valor: Math.round(valor) }));
   };
   const topForn = mergeTop("topFornecedores"), topCli = mergeTop("topClientes");
+  // finaliza DRE do grupo: só mostra CMV/resultado do mês quando TODAS as 4 lojas têm o dado
+  const dreG = g.dre.map(gd => {
+    const cmvKnown = gd.nCmv === 4, opexKnown = gd.nDesp === 4;
+    return {
+      ym: gd.ym, mesN: gd.mesN, receita: gd.receita,
+      cmv: cmvKnown ? gd.cmv : null, lucroBruto: cmvKnown ? gd.lucroBruto : null,
+      margemPct: (cmvKnown && gd.receita > 0) ? Math.round(gd.lucroBruto / gd.receita * 1000) / 10 : null, margemRawPct: null,
+      despBuckets: opexKnown ? gd.despBuckets : null, opex: opexKnown ? gd.opex : null,
+      resultado: (cmvKnown && opexKnown) ? gd.lucroBruto - gd.opex : null,
+      anomalias: gd.anomalias, temDesp: gd.nDesp > 0,
+    };
+  });
   return {
+    dre: dreG,
     mensal: g.mensal, transitoPorMes: g.transitoPorMes, transitoTotal: Object.values(g.transitoPorMes).reduce((s, v) => s + v, 0),
     key: "GRUPO", meses: fat26.meses, serie26, serie25, iAtual: fat26.meses.length - 1, ritmoDia, projCurMes, ritmoCurDia,
     fatAtual, fatAnt, fat25Atual, buckets: g.buckets, totalDespesa,
@@ -462,11 +512,101 @@ function dividaCallout(key) {
   return `<div class="callout"><span class="callout-i">⚠️</span><div>${txt}</div></div>`;
 }
 
+// ── DRE (Demonstração de Resultado gerencial) ──────────────────────────────────
+const DESP_ORDEM = ["pessoal", "estrutura", "impostos", "outros", "financiamento"]; // mercadoria fica no CMV
+const bucketLabel = k => (BUCKETS.find(b => b.key === k) || {}).label || k;
+
+// agrega as marcas com custo médio corrompido ao longo de 2026 (p/ o dono corrigir no ERP)
+function anomaliasAgreg(m) {
+  const acc = {};
+  for (const d of m.dre) for (const a of (d.anomalias || [])) {
+    const nome = a.marca + (a.loja ? ` (${a.loja})` : "");
+    acc[nome] = (acc[nome] || 0) + Math.max(0, (a.custo || 0) - (a.fat || 0));
+  }
+  return Object.entries(acc).filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]);
+}
+
+function dreResumo(m) {
+  const i = m.iAtual, cur = m.dre[i], ant = m.dre[i - 1] || null;
+  if (!cur) return `<div class="muted small">Sem dados de margem para montar o DRE deste mês.</div>`;
+  const rec = cur.receita, rec25 = m.serie25[i] || 0;
+  const pc = v => (v != null && rec > 0) ? `<span class="dre2-pct">${(v / rec * 100).toFixed(0)}%</span>` : "";
+  const val = v => v == null ? '<span class="muted">—</span>' : fmt(-Math.abs(v));
+  const row = (lbl, v, { bold, pos, ind, pctOf } = {}) => `<div class="dre2-row${ind ? " ind" : ""}${bold ? " dre2-bold" : ""}">
+    <div class="dre2-lbl">${lbl}</div>
+    <div class="dre2-amt ${v != null && bold ? (v >= 0 ? "ok" : "crit") : ""}">${pos ? (v == null ? '<span class="muted">—</span>' : fmt(v)) : val(v)}</div>
+    ${pctOf === false ? "<span></span>" : pc(v == null ? null : Math.abs(v))}</div>`;
+  const db = cur.despBuckets;
+  const despRows = db ? DESP_ORDEM.filter(k => (db[k] || 0) > 0).map(k => row(bucketLabel(k), db[k], { ind: true })).join("") : `<div class="dre2-row ind"><div class="dre2-lbl muted">despesas pagas ainda não coletadas neste mês</div><div class="dre2-amt muted">—</div><span></span></div>`;
+  const yoRec = rec25 ? pct(rec - rec25, rec25) : 0;
+  const resPct = (cur.resultado != null && rec > 0) ? cur.resultado / rec * 100 : null;
+  const dRes = (ant && ant.resultado != null && cur.resultado != null) ? cur.resultado - ant.resultado : null;
+  return `
+  <div class="dre2">
+    <div class="dre2-row dre2-top"><div class="dre2-lbl">Receita (faturamento)</div><div class="dre2-amt">${fmt(rec)}</div><span class="dre2-pct">100%</span></div>
+    ${row("(−) CMV (custo da mercadoria vendida)", cur.cmv)}
+    <div class="dre2-row dre2-bold dre2-sum"><div class="dre2-lbl">= Lucro Bruto</div><div class="dre2-amt ok">${cur.lucroBruto == null ? "—" : fmt(cur.lucroBruto)}</div>${cur.margemPct != null ? `<span class="dre2-pct">${cur.margemPct.toFixed(0)}%</span>` : "<span></span>"}</div>
+    ${despRows}
+    <div class="dre2-row dre2-bold dre2-sum dre2-fim"><div class="dre2-lbl">= Resultado ${cur.emCurso ? '<span class="tag">parcial</span>' : ""}</div><div class="dre2-amt ${cur.resultado != null ? (cur.resultado >= 0 ? "ok" : "crit") : ""}">${cur.resultado == null ? "—" : fmt(cur.resultado)}</div>${resPct != null ? `<span class="dre2-pct ${resPct >= 0 ? "ok" : "crit"}">${resPct.toFixed(0)}%</span>` : "<span></span>"}</div>
+  </div>
+  <div class="dre2-cmp">
+    <span>vs ${mesNome(ant ? ant.ym : cur.ym)}: ${dRes == null ? "—" : `<b class="${dRes >= 0 ? "ok" : "crit"}">${dRes >= 0 ? "▲" : "▼"} ${fmtK(Math.abs(dRes))}</b> no resultado`}</span>
+    <span>·</span>
+    <span>Receita YoY: <b class="${yoRec >= 0 ? "ok" : "crit"}">${rec25 ? fmtPct(yoRec) : "—"}</b> vs 2025</span>
+  </div>`;
+}
+
+function dreTabela(m) {
+  const linhas = m.dre.filter(d => d.receita > 0);
+  if (!linhas.length) return "";
+  const td = (v, cls) => `<td class="num ${cls || ""}">${v == null ? '<span class="muted">—</span>' : fmt(v)}</td>`;
+  return `<div class="tbl-scroll"><table class="tbl dre-tbl"><thead><tr>
+    <th>Mês</th><th class="num">Receita</th><th class="num">CMV</th><th class="num">Lucro Bruto</th><th class="num">Margem</th><th class="num">Despesas</th><th class="num">Resultado</th><th class="num">Result.%</th>
+  </tr></thead><tbody>
+  ${linhas.map(d => {
+    const cur = d.mesN === (new Date().getMonth() + 1) && d.ym.slice(0, 4) === String(new Date().getFullYear());
+    const resPct = (d.resultado != null && d.receita > 0) ? d.resultado / d.receita * 100 : null;
+    return `<tr${cur ? ' class="cur"' : ""}><td>${mesNome(d.ym)}${cur ? ' <span class="tag">atual</span>' : ""}</td>
+      ${td(d.receita)}${td(d.cmv == null ? null : -d.cmv)}${td(d.lucroBruto)}
+      <td class="num">${d.margemPct == null ? '<span class="muted">—</span>' : d.margemPct.toFixed(0) + "%"}</td>
+      ${td(d.opex == null ? null : -d.opex)}
+      <td class="num ${d.resultado != null ? (d.resultado >= 0 ? "ok" : "crit") : ""}"><b>${d.resultado == null ? '<span class="muted">—</span>' : fmt(d.resultado)}</b></td>
+      <td class="num ${resPct != null ? (resPct >= 0 ? "ok" : "crit") : ""}">${resPct == null ? "" : resPct.toFixed(0) + "%"}</td></tr>`;
+  }).join("")}
+  </tbody></table></div>`;
+}
+
+function dreSection(m) {
+  const anoms = anomaliasAgreg(m);
+  const temMargem = m.dre.some(d => d.margemPct != null);
+  if (!temMargem) return ""; // sem margem coletada → não renderiza o DRE (resto do painel segue)
+  const anomCallout = anoms.length ? `<div class="callout" style="background:#fffbeb;border-color:#fde68a;border-left-color:var(--warn);color:#78350f">
+    <span class="callout-i">⚠️</span><div><b>Custo médio corrompido no ERP</b> em ${anoms.length} marca(s) — o DRE já usa a <b>margem corrigida</b> (essas marcas entram com margem 0, não negativa). Para a margem ficar exata, corrija o <b>custo médio</b> destas no ERP (maiores desvios): ${anoms.slice(0, 5).map(([n, v]) => `${esc(n)} <span class="muted">(+${fmtK(v)} custo irreal)</span>`).join(" · ")}.</div></div>` : "";
+  return `
+  <section class="card">
+    <div class="card-h"><h3>📊 DRE — Demonstração de Resultado ${m.key === "GRUPO" ? "(consolidado)" : ""}</h3>
+      <span class="muted small">receita + CMV por venda · despesas por caixa (pago)</span></div>
+    ${anomCallout}
+    <div class="grid2 dre-grid">
+      <div>
+        <div class="dre2-cap">Resultado de ${mesNome(m.dre[m.iAtual].ym)}</div>
+        ${dreResumo(m)}
+      </div>
+      <div>
+        <div class="dre2-cap">Mês a mês — ${fat26.ano}</div>
+        ${dreTabela(m)}
+      </div>
+    </div>
+    <div class="note small"><b>Como ler:</b> <b>CMV</b> = custo real da mercadoria vendida (custo época do ERP, por marca, já limpo de custo médio corrompido). <b>Lucro Bruto</b> = Receita − CMV (a % é a margem bruta). <b>Despesas</b> = contas efetivamente <b>pagas no mês</b> (regime de caixa), sem a compra de mercadoria (que já está no CMV). <b>Resultado</b> = Lucro Bruto − Despesas: é um resultado <b>gerencial</b> (a venda do mês menos o custo dela e o que saiu do caixa), não o lucro contábil. Impostos = DAS/Simples pagos no mês.</div>
+  </section>`;
+}
+
 function tabContent(m, isGrupo) {
   const apertos = m.fluxo.filter(f => f.sai > f.entra).length;
   return `
   ${dividaCallout(m.key)}
   ${kpiCards(m)}
+  ${dreSection(m)}
 
   <div class="grid2">
     <section class="card wide">
@@ -614,6 +754,25 @@ const htmlFull = `${html}
   .cc-tbl td{white-space:nowrap}
   .cc-tbl tr.div td{border-top:2px solid var(--border)}
   .cc-tbl tr.cc-neg{background:#fef2f2}
+  .dre-grid{align-items:start}
+  .dre2-cap{font-size:11.5px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.3px;margin-bottom:8px}
+  .dre2{border:1px solid var(--border);border-radius:12px;overflow:hidden}
+  .dre2-row{display:grid;grid-template-columns:1fr 110px 44px;align-items:center;gap:6px;padding:7px 12px;font-size:12.5px;border-bottom:1px solid #f1f5f9}
+  .dre2-row:last-child{border-bottom:none}
+  .dre2-lbl{color:var(--text2)}
+  .dre2-amt{text-align:right;font-variant-numeric:tabular-nums;color:var(--text2)}
+  .dre2-pct{text-align:right;font-size:11px;color:var(--muted2)}
+  .dre2-row.ind .dre2-lbl{padding-left:12px;color:var(--muted);font-size:12px}
+  .dre2-top{background:var(--card2);font-weight:700}.dre2-top .dre2-amt{color:var(--text);font-weight:700}
+  .dre2-bold{font-weight:700}.dre2-bold .dre2-lbl{color:var(--text)}
+  .dre2-sum{background:var(--card2);border-top:1px solid var(--border)}
+  .dre2-fim{border-top:2px solid var(--border)}
+  .dre2-amt.ok{color:var(--ok)}.dre2-amt.crit{color:var(--crit)}
+  .dre2-pct.ok{color:var(--ok)}.dre2-pct.crit{color:var(--crit)}
+  .dre2-cmp{display:flex;gap:8px;flex-wrap:wrap;align-items:center;font-size:11.5px;color:var(--muted);margin-top:10px}
+  .dre-tbl td,.dre-tbl th{padding:5px 7px}
+  .dre-tbl .ok{color:var(--ok)}.dre-tbl .crit{color:var(--crit)}
+  @media(max-width:820px){.dre2-row{grid-template-columns:1fr 92px 38px;font-size:12px}}
   .foot{text-align:center;color:var(--muted2);font-size:11px;margin:18px 0 6px}
   .lock{max-width:380px;margin:60px auto;background:var(--card);border:1px solid var(--border);border-top:3px solid var(--accent);border-radius:16px;padding:30px 28px;box-shadow:var(--shadow);text-align:center}
   .lock h2{font-size:17px;font-weight:800;margin-bottom:6px}
